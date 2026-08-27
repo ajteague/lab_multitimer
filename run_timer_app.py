@@ -1,9 +1,29 @@
+"""Shock Timer
+
+Multi-subject experiment timer with persistent experiment state, audit-safe undo,
+MAP capture, anesthesia tracking, exported timesheets, and a compact Streamlit UI.
+
+Maintenance notes
+-----------------
+* TESTING_MODE is the single production/testing switch.
+* Subject state lives in ``st.session_state`` and is persisted as JSON per mouse.
+* Timer callbacks record global undo snapshots before mutating persistent state.
+* Browser-side JavaScript is limited to UI behavior that Streamlit cannot provide
+  directly (attention highlighting, fullscreen handling, scheduled alert audio,
+  and automatic downloads).
+* Visual CSS is intentionally installed once in cascade order. Keeping a single
+  style element reduces Streamlit DOM overhead while preserving the exact rule
+  precedence of prior versions.
+"""
+
 import base64
 import html
 import io
 import json
 import math
 import os
+import random
+import re
 import sqlite3
 import struct
 import threading
@@ -21,7 +41,11 @@ import streamlit.components.v1 as components
 # APP SETTINGS — V40 keeps the V39 timing/behavior defaults.
 # ============================================================
 
-TIME_UNIT = "minutes"
+# Change ONLY this line to switch modes:
+TESTING_MODE = False
+
+# Production uses minutes. Testing uses the same numeric durations as seconds.
+TIME_UNIT = "seconds" if TESTING_MODE else "minutes"
 REFRESH_INTERVAL = 1.0
 
 DEFAULT_INITIAL_ANESTHESIA = 45
@@ -38,11 +62,22 @@ FIXED_RESUSCITATION_DURATION = 20
 INITIAL_MOUSE_COUNT = 8
 WARNING_UNITS = 1
 APP_TIMEZONE = "America/New_York"
-STATE_VERSION = "lab_multitimer_v40_refined_card_ui"
+STATE_VERSION = "lab_multitimer_v61_refactored"
 
 UNIT_SECONDS = 1.0 if TIME_UNIT == "seconds" else 60.0
 UNIT_SHORT = "s" if TIME_UNIT == "seconds" else "m"
 UNIT_LABEL = "sec" if TIME_UNIT == "seconds" else "min"
+UNIT_WORD = "seconds" if TIME_UNIT == "seconds" else "minutes"
+TEST_WEIGHT_MIN_G = 22.0
+TEST_WEIGHT_MAX_G = 35.0
+
+# Reused immutable objects / layout definitions. Keeping these centralized makes
+# the UI easier to tune without scattering numeric column ratios through the app.
+APP_TZ = ZoneInfo(APP_TIMEZONE)
+RUNNING_ROW_COLUMNS = [1.38, 1.14, 0.74, 3.22, 1.96, 0.18, 1.58]
+RUNNING_ACTION_COLUMNS = [1.0, 0.28]
+HEADER_COLUMNS = [1.02, 4.10, 0.90, 0.88, 1.42, 1.22, 0.88]
+CONFIGURATION_COLUMNS = [0.58, 3.52, 1.58, 0.58]
 
 st.set_page_config(
     page_title="Shock Timer",
@@ -52,12 +87,13 @@ st.set_page_config(
 )
 
 # ============================================================
-# V40 VISUAL SYSTEM
+# VISUAL SYSTEM
 # ============================================================
 
-st.markdown(
-    r"""
-    <style>
+# All historical UI rules are retained in their original cascade order, but are
+# injected as one style element instead of 16 separate Streamlit markdown nodes.
+# This reduces frontend DOM work on every rerun without changing visual behavior.
+APP_CSS = r"""
     :root {
         --bg0:#07101a; --bg1:#0a1420; --panel:#111d2a; --panel2:#0d1722;
         --border:rgba(137,160,184,.20); --border2:rgba(137,160,184,.30);
@@ -174,16 +210,1658 @@ st.markdown(
     div[class*="st-key-add_mouse_card"] button{width:100%!important;min-height:4.30rem!important;border:1px dashed rgba(137,160,184,.29)!important;border-radius:11px!important;background:linear-gradient(180deg,rgba(17,29,42,.44),rgba(11,21,31,.44))!important;color:#e2e8ee!important;font-size:.88rem!important;font-weight:680!important}
     .lab-completed-section-title{color:#7e8c9b!important;font-size:.65rem!important;font-weight:760!important;text-transform:uppercase!important;letter-spacing:.08em!important;border-top:1px solid rgba(137,160,184,.13)!important;margin-top:.70rem!important;padding:.80rem .12rem .15rem!important}
 
-    .st-key-configuration_table [data-testid="stVerticalBlock"]{gap:.16rem!important}.st-key-configuration_table input,.st-key-configuration_table button{min-height:2.35rem!important;height:2.35rem!important}
+    .st-key-configuration_table [data-testid="stVerticalBlock"]{gap:.16rem!important}
+    .st-key-configuration_table input,.st-key-configuration_table button{min-height:2.35rem!important;height:2.35rem!important}
+    .st-key-configuration_table .lab-config-header{
+        display:flex!important;align-items:flex-end!important;min-height:1.45rem!important;
+        padding:.18rem .08rem .34rem!important;margin:0!important;line-height:1.15!important;
+        position:relative!important;z-index:5!important;overflow:visible!important;white-space:nowrap!important;
+    }
+    .st-key-configuration_table [data-testid="stMarkdownContainer"]:has(.lab-config-header),
+    .st-key-configuration_table [data-testid="stMarkdown"]:has(.lab-config-header){
+        min-height:1.45rem!important;overflow:visible!important;
+    }
     div[class*="st-key-delete_exp_confirm_"] button,div[class*="st-key-end_exp_confirm_"] button,div[class*="st-key-end_confirm_"] button,div[class*="st-key-reset_confirm_"] button,div[class*="st-key-end_all_confirm"] button{
         background:linear-gradient(180deg,rgba(185,55,75,.96),rgba(139,38,55,.96))!important;border-color:rgba(239,101,120,.72)!important;color:#fff!important}
     #lab-attention-v40{left:1.35rem!important;right:1.35rem!important;bottom:1rem!important;padding:.72rem .92rem!important;border-radius:11px!important;background:rgba(11,20,30,.97)!important;border:1px solid rgba(245,161,38,.30)!important;box-shadow:0 16px 48px rgba(0,0,0,.36)!important;color:#e8edf2!important;font:650 13px/1.25 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important}
     #lab-attention-v40 .orange{color:#ffc169!important}#lab-attention-v40 .red{color:#ff9cab!important}#lab-attention-v40 .x{color:#99a6b3!important;cursor:pointer;float:right}
     @media(max-width:1180px){.stMainBlockContainer{min-width:1140px}}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+
+    /* =========================================================
+       V40 COMPACT DENSITY PASS
+       Same selected design; optimized to show more channels.
+       ========================================================= */
+
+    .stMainBlockContainer{
+        padding:.62rem 1.20rem 4.75rem!important;
+    }
+    html,body,[data-testid="stAppViewContainer"],.stApp {
+        background:radial-gradient(circle at 50% -18%,rgba(37,66,95,.20),transparent 40%),
+                   linear-gradient(180deg,var(--bg1) 0%,var(--bg0) 100%)!important;
+        color:var(--text)!important;color-scheme:dark;
+    }
+    [data-testid="stAppViewContainer"]>.main{background:transparent!important}
+    [data-testid="stHeader"],[data-testid="stToolbar"],footer{display:none!important}
+    .stMainBlockContainer{max-width:100%!important;padding:1.05rem 1.35rem 6rem!important}
+    [data-testid="stVerticalBlock"]{gap:.54rem}[data-testid="stHorizontalBlock"]{gap:.68rem}
+    h1,h2,h3,h4{color:var(--text)!important;letter-spacing:-.025em}
+    [data-testid="stCaptionContainer"]{color:var(--muted)!important}
+
+    [data-testid="stVerticalBlock"]{gap:.34rem}
+    [data-testid="stHorizontalBlock"]{gap:.52rem}
+
+    .lab-header-title{
+        font-size:1.58rem!important;
+        line-height:1.00!important;
+    }
+    .lab-header-subtitle{
+        font-size:.74rem!important;
+        margin-top:.16rem!important;
+    }
+    .lab-divider{
+        margin:.44rem 0 .42rem!important;
+    }
+
+    div[class*="st-key-back_to_experiments"] button,
+    div[class*="st-key-fullscreen_view"] button,
+    div[class*="st-key-global_undo_"] button,
+    div[class*="st-key-open_settings"] button,
+    div[class*="st-key-export_timesheets"] button,
+    div[class*="st-key-end_all_subjects"] button{
+        min-height:2.55rem!important;
+        height:2.55rem!important;
+        font-size:.78rem!important;
+        padding-top:0!important;
+        padding-bottom:0!important;
+    }
+
+    div[class*="st-key-mouse_row_"]{
+        padding:.42rem .78rem!important;
+        margin-bottom:.08rem!important;
+        border-radius:10px!important;
+    }
+
+    div[class*="st-key-mouse_row_"] [data-testid="stVerticalBlock"]{
+        gap:.10rem!important;
+    }
+    div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"]{
+        gap:.42rem!important;
+    }
+
+    .lab-cell{
+        min-height:3.70rem!important;
+        padding:0 .02rem!important;
+    }
+
+    .lab-mouse-wrap{
+        min-height:3.70rem!important;
+        gap:.42rem!important;
+    }
+    .lab-mouse-identity{gap:.46rem!important}
+    .lab-mouse-icon{
+        width:1.70rem!important;
+        height:1.70rem!important;
+    }
+    .lab-dot{
+        width:.54rem!important;
+        height:.54rem!important;
+    }
+    .lab-mouse-name{
+        font-size:.91rem!important;
+    }
+    .lab-paused-label{
+        font-size:.54rem!important;
+        margin-bottom:.10rem!important;
+    }
+
+    .lab-mini-label{
+        font-size:.55rem!important;
+        margin-bottom:.24rem!important;
+    }
+    .lab-primary-text{
+        font-size:.79rem!important;
+        line-height:1.08!important;
+    }
+    .lab-secondary-text{
+        font-size:.63rem!important;
+        margin-top:.14rem!important;
+        line-height:1.05!important;
+    }
+    .lab-next-caption{
+        font-size:.74rem!important;
+    }
+    .lab-next-time{
+        margin-top:.18rem!important;
+        font-size:.98rem!important;
+    }
+    .lab-total{
+        font-size:.82rem!important;
+    }
+
+    .lab-stepper{
+        padding:.02rem .04rem 0!important;
+    }
+    .lab-step:not(:last-child)::after{
+        top:.60rem!important;
+        left:calc(50% + .69rem)!important;
+        right:calc(-50% + .69rem)!important;
+        height:1.5px!important;
+    }
+    .lab-step-circle{
+        width:1.20rem!important;
+        height:1.20rem!important;
+        font-size:.59rem!important;
+    }
+    .lab-step-label{
+        font-size:.63rem!important;
+        margin-top:.18rem!important;
+        line-height:1.00!important;
+    }
+    .lab-step-time{
+        min-height:.62rem!important;
+        margin-top:.08rem!important;
+        font-size:.61rem!important;
+        line-height:1.00!important;
+    }
+
+    .lab-anesthesia-copy{
+        display:flex;
+        flex-direction:column;
+        justify-content:flex-end;
+        min-height:2.20rem;
+        margin:0;
+    }
+
+    div[class*="st-key-anesthesia_redose_action_"] button,
+    div[class*="st-key-anesthesia_delay_action_"] button{
+        min-height:1.82rem!important;
+        height:1.82rem!important;
+        margin-top:.04rem!important;
+        padding:0 .36rem!important;
+        border-radius:7px!important;
+        font-size:.65rem!important;
+    }
+
+    div[class*="st-key-primary_action_"] button,
+    div[class*="st-key-primary_pause_"] button,
+    div[class*="st-key-primary_start_anesthesia_"] button,
+    div[class*="st-key-primary_start_anesthesia_wrapper_"] button{
+        min-height:2.55rem!important;
+        height:2.55rem!important;
+        font-size:.78rem!important;
+    }
+
+    div[class*="st-key-mouse_action_menu_"] button{
+        min-height:2.55rem!important;
+        height:2.55rem!important;
+        min-width:2.35rem!important;
+        font-size:.93rem!important;
+    }
+
+    div[class*="st-key-add_mouse_card"] button{
+        min-height:2.85rem!important;
+        height:2.85rem!important;
+        font-size:.78rem!important;
+        border-radius:9px!important;
+    }
+
+    .lab-completed-section-title{
+        margin-top:.38rem!important;
+        padding:.48rem .10rem .08rem!important;
+        font-size:.58rem!important;
+    }
+
+    @media (min-height:1050px){
+        div[class*="st-key-mouse_row_"]{padding:.48rem .82rem!important}
+        .lab-cell,.lab-mouse-wrap{min-height:3.92rem!important}
+    }
+
+    
+
+    /* ---------------- Home header ---------------- */
+    .home-brand {
+        display:flex;
+        align-items:center;
+        gap:.72rem;
+        margin:.18rem 0 .08rem;
+    }
+    .home-brand-icon {
+        width:2.15rem;
+        height:2.15rem;
+        flex:0 0 auto;
+        display:grid;
+        place-items:center;
+        border:1px solid rgba(137,160,184,.22);
+        border-radius:50%;
+        background:linear-gradient(180deg,rgba(20,34,49,.88),rgba(12,22,33,.88));
+        color:#f5a126;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.025);
+    }
+    .home-brand-icon svg {
+        width:1.28rem;
+        height:1.28rem;
+        fill:none;
+        stroke:currentColor;
+        stroke-width:1.7;
+        stroke-linecap:round;
+        stroke-linejoin:round;
+    }
+    .home-brand-title {
+        color:#f7f9fb;
+        font-size:1.58rem;
+        line-height:1;
+        font-weight:780;
+        letter-spacing:-.04em;
+    }
+    .home-brand-subtitle {
+        color:#8492a1;
+        font-size:.76rem;
+        margin-top:.22rem;
+    }
+
+    /* Compact warning only when cloud storage is unavailable. */
+    div[class*="st-key-home_cloud_warning"] [data-testid="stAlert"] {
+        min-height:auto!important;
+        padding:.52rem .72rem!important;
+        margin:.18rem 0 .10rem!important;
+        background:rgba(75,45,16,.32)!important;
+        border:1px solid rgba(245,161,38,.32)!important;
+        color:#ffd49a!important;
+    }
+    div[class*="st-key-home_cloud_warning"] [data-testid="stAlert"] p {
+        font-size:.75rem!important;
+        line-height:1.18!important;
+    }
+
+    /* ---------------- Major home cards ---------------- */
+    div[class*="st-key-home_new_experiment"],
+    div[class*="st-key-home_active_section"],
+    div[class*="st-key-home_completed_section"] {
+        position:relative;
+        overflow:hidden;
+        background:
+            radial-gradient(circle at 45% -115%,rgba(72,105,139,.11),transparent 52%),
+            linear-gradient(180deg,rgba(18,31,45,.94),rgba(12,22,33,.94))!important;
+        border:1px solid rgba(137,160,184,.20)!important;
+        border-radius:11px!important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.020),0 5px 18px rgba(0,0,0,.06)!important;
+    }
+
+    div[class*="st-key-home_new_experiment"] {
+        padding:.76rem .90rem .70rem!important;
+        margin-top:.68rem!important;
+        margin-bottom:.46rem!important;
+    }
+    div[class*="st-key-home_active_section"],
+    div[class*="st-key-home_completed_section"] {
+        padding:.72rem .90rem .78rem!important;
+        margin-top:.08rem!important;
+        margin-bottom:.44rem!important;
+    }
+
+    div[class*="st-key-home_new_experiment"] [data-testid="stVerticalBlock"],
+    div[class*="st-key-home_active_section"] [data-testid="stVerticalBlock"],
+    div[class*="st-key-home_completed_section"] [data-testid="stVerticalBlock"] {
+        gap:.34rem!important;
+    }
+
+    .home-section-title {
+        color:#f2f5f8;
+        font-size:1.01rem;
+        line-height:1.08;
+        font-weight:735;
+        letter-spacing:-.018em;
+        margin:.02rem 0 .32rem;
+    }
+    .home-section-count {
+        color:#748393;
+        font-size:.66rem;
+        font-weight:650;
+        margin-left:.34rem;
+    }
+
+    /* ---------------- New experiment row ---------------- */
+    div[class*="st-key-home_new_experiment"] [data-testid="stForm"] {
+        padding:0!important;
+        border:0!important;
+        background:transparent!important;
+    }
+    div[class*="st-key-home_new_experiment"] [data-testid="stWidgetLabel"] p {
+        font-size:.68rem!important;
+        color:#aeb9c4!important;
+        margin-bottom:.12rem!important;
+    }
+    div[class*="st-key-home_new_experiment"] input {
+        min-height:2.62rem!important;
+        height:2.62rem!important;
+        font-size:.78rem!important;
+        border-radius:8px!important;
+    }
+    div[class*="st-key-home_new_experiment"] [data-testid="stNumberInput"] button {
+        min-height:2.62rem!important;
+        height:2.62rem!important;
+        width:2.48rem!important;
+        border-radius:0!important;
+    }
+    div[class*="st-key-home_new_experiment"] [data-testid="stFormSubmitButton"] button {
+        min-height:2.62rem!important;
+        height:2.62rem!important;
+        margin-top:0!important;
+        border-radius:8px!important;
+        border-color:rgba(245,161,38,.82)!important;
+        background:linear-gradient(180deg,#ec961c,#c87309)!important;
+        color:#fff7eb!important;
+        font-size:.80rem!important;
+        font-weight:735!important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 7px 18px rgba(245,161,38,.10)!important;
+    }
+    div[class*="st-key-home_new_experiment"] [data-testid="stFormSubmitButton"] button:hover {
+        background:linear-gradient(180deg,#f2a128,#d27b0c)!important;
+        border-color:#ffad36!important;
+    }
+
+    /* ---------------- Experiment rows ---------------- */
+    div[class*="st-key-home_exp_card_"] {
+        background:linear-gradient(180deg,rgba(13,24,36,.68),rgba(10,19,29,.68))!important;
+        border:1px solid rgba(137,160,184,.16)!important;
+        border-radius:9px!important;
+        padding:.43rem .58rem!important;
+        margin:.08rem 0!important;
+        box-shadow:none!important;
+    }
+    div[class*="st-key-home_exp_card_"] [data-testid="stVerticalBlock"] {
+        gap:.08rem!important;
+    }
+    div[class*="st-key-home_exp_card_"] [data-testid="stHorizontalBlock"] {
+        gap:.38rem!important;
+    }
+
+    .home-exp-info {
+        display:flex;
+        align-items:center;
+        gap:.62rem;
+        min-height:2.66rem;
+        min-width:0;
+    }
+    .home-exp-status {
+        width:.50rem;
+        height:.50rem;
+        border-radius:50%;
+        flex:0 0 auto;
+        background:#5ed276;
+        box-shadow:0 0 0 3px rgba(94,210,118,.055);
+    }
+    .home-exp-status.completed {
+        width:1.08rem;
+        height:1.08rem;
+        display:grid;
+        place-items:center;
+        color:#72869a;
+        background:transparent;
+        border:1.5px solid rgba(114,134,154,.64);
+        box-shadow:none;
+        font-size:.66rem;
+        font-weight:800;
+    }
+    .home-exp-text {
+        min-width:0;
+    }
+    .home-exp-name {
+        color:#edf2f6;
+        font-size:.82rem;
+        line-height:1.05;
+        font-weight:720;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+    }
+    .home-exp-meta {
+        color:#7f8e9e;
+        font-size:.67rem;
+        line-height:1.06;
+        margin-top:.20rem;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+    }
+
+    /* Smaller, quieter management actions. */
+    div[class*="st-key-home_exp_card_"] .stButton>button {
+        min-height:2.30rem!important;
+        height:2.30rem!important;
+        padding:0 .50rem!important;
+        border-radius:8px!important;
+        font-size:.72rem!important;
+        font-weight:650!important;
+        background:linear-gradient(180deg,rgba(19,32,46,.86),rgba(13,23,34,.86))!important;
+        border-color:rgba(137,160,184,.21)!important;
+        box-shadow:none!important;
+    }
+    div[class*="st-key-home_exp_card_"] .stButton>button:hover {
+        background:linear-gradient(180deg,rgba(25,42,59,.92),rgba(16,28,41,.92))!important;
+        border-color:rgba(152,178,204,.36)!important;
+    }
+
+    /* Delete is the only consistently destructive control on the home list. */
+    div[class*="st-key-home_delete_"] button {
+        color:#ff8e9e!important;
+        border-color:rgba(239,101,120,.52)!important;
+        background:rgba(239,101,120,.025)!important;
+    }
+    div[class*="st-key-home_delete_"] button:hover {
+        color:#ffadba!important;
+        border-color:rgba(239,101,120,.72)!important;
+        background:rgba(239,101,120,.07)!important;
+    }
+
+    /* Empty states stay quiet inside the card. */
+    .home-empty-state {
+        color:#718090;
+        font-size:.72rem;
+        padding:.42rem .10rem .26rem;
+    }
+
+    /* Error messages from new-experiment validation remain compact. */
+    div[class*="st-key-home_new_experiment"] [data-testid="stAlert"] {
+        padding:.48rem .64rem!important;
+        margin-top:.18rem!important;
+    }
+
+    @media(max-width:1180px) {
+        .home-exp-meta { font-size:.63rem; }
+    }
+    
+
+    /* ---------- Home screen text / button balance ---------- */
+    .home-brand-title{
+        font-size:1.74rem!important;
+        line-height:1.00!important;
+    }
+    .home-brand-subtitle{
+        font-size:.82rem!important;
+        margin-top:.20rem!important;
+    }
+    .home-section-title{
+        font-size:1.08rem!important;
+        margin:.02rem 0 .36rem!important;
+    }
+    .home-section-count{
+        font-size:.72rem!important;
+    }
+
+    div[class*="st-key-home_new_experiment"]{
+        padding:.84rem .98rem .78rem!important;
+    }
+    div[class*="st-key-home_new_experiment"] [data-testid="stWidgetLabel"] p{
+        font-size:.73rem!important;
+        font-weight:660!important;
+        color:#bcc7d1!important;
+        margin-bottom:.15rem!important;
+    }
+    div[class*="st-key-home_new_experiment"] input{
+        min-height:2.74rem!important;
+        height:2.74rem!important;
+        font-size:.86rem!important;
+    }
+    div[class*="st-key-home_new_experiment"] [data-testid="stNumberInput"] button{
+        min-height:2.74rem!important;
+        height:2.74rem!important;
+        width:2.58rem!important;
+    }
+    div[class*="st-key-home_new_experiment"] [data-testid="stFormSubmitButton"] button{
+        min-height:2.74rem!important;
+        height:2.74rem!important;
+        font-size:.92rem!important;
+        font-weight:745!important;
+        padding:0 .78rem!important;
+    }
+
+    .home-exp-name{
+        font-size:.90rem!important;
+    }
+    .home-exp-meta{
+        font-size:.72rem!important;
+        margin-top:.22rem!important;
+    }
+    div[class*="st-key-home_exp_card_"]{
+        padding:.48rem .64rem!important;
+    }
+    div[class*="st-key-home_exp_card_"] .stButton>button{
+        min-height:2.22rem!important;
+        height:2.22rem!important;
+        font-size:.78rem!important;
+        font-weight:665!important;
+        padding:0 .52rem!important;
+    }
+
+    /* ---------- Configure experiment dialog ---------- */
+    .cfg-dialog-name{
+        color:#eef3f7!important;
+        font-size:1.02rem!important;
+        font-weight:740!important;
+        line-height:1.10!important;
+        margin:.12rem 0 .12rem!important;
+    }
+    .cfg-dialog-subtitle{
+        color:#8492a1!important;
+        font-size:.76rem!important;
+        line-height:1.26!important;
+        margin:0 0 .54rem!important;
+    }
+
+    .st-key-configuration_table [data-testid="stVerticalBlock"]{
+        gap:.18rem!important;
+    }
+    .st-key-configuration_table input,
+    .st-key-configuration_table button{
+        min-height:2.38rem!important;
+        height:2.38rem!important;
+    }
+    .st-key-configuration_table input{
+        font-size:.84rem!important;
+    }
+    .st-key-configuration_table .lab-config-header{
+        color:#93a2b1!important;
+        font-size:.64rem!important;
+        font-weight:760!important;
+        letter-spacing:.08em!important;
+        text-transform:uppercase!important;
+        display:flex!important;
+        align-items:flex-end!important;
+        min-height:1.18rem!important;
+        padding:.06rem .08rem .20rem!important;
+        margin:0!important;
+        white-space:nowrap!important;
+    }
+
+    div[class*="st-key-cfg_row_card_"]{
+        background:linear-gradient(180deg,rgba(13,24,36,.66),rgba(10,19,29,.66))!important;
+        border:1px solid rgba(137,160,184,.15)!important;
+        border-radius:9px!important;
+        padding:.22rem .26rem!important;
+        margin:.02rem 0!important;
+    }
+    div[class*="st-key-cfg_row_card_"] [data-testid="stVerticalBlock"]{
+        gap:.06rem!important;
+    }
+    div[class*="st-key-cfg_row_card_"] [data-testid="stHorizontalBlock"]{
+        gap:.34rem!important;
+    }
+
+    .cfg-row-index{
+        color:#edf2f6!important;
+        font-size:.80rem!important;
+        font-weight:730!important;
+        min-height:2.32rem!important;
+        display:flex!important;
+        align-items:center!important;
+        padding-left:.08rem!important;
+    }
+
+    div[class*="st-key-cfg_remove_wrap_"] button{
+        min-height:2.32rem!important;
+        height:2.32rem!important;
+        border-radius:8px!important;
+        font-size:.98rem!important;
+        font-weight:720!important;
+    }
+
+    div[class*="st-key-cfg_add_mouse_wrap"] button{
+        min-height:2.86rem!important;
+        height:2.86rem!important;
+        border-radius:9px!important;
+        border:1px dashed rgba(137,160,184,.28)!important;
+        background:linear-gradient(180deg,rgba(17,29,42,.44),rgba(11,21,31,.44))!important;
+        color:#e2e8ee!important;
+        font-size:.85rem!important;
+        font-weight:690!important;
+    }
+
+    div[class*="st-key-cfg_cancel_wrap"] button,
+    div[class*="st-key-cfg_start_wrap"] button{
+        min-height:2.82rem!important;
+        height:2.82rem!important;
+        border-radius:9px!important;
+        font-size:.88rem!important;
+        font-weight:710!important;
+    }
+    div[class*="st-key-cfg_start_wrap"] button{
+        border-color:rgba(245,161,38,.82)!important;
+        background:linear-gradient(180deg,#ec961c,#c87309)!important;
+        color:#fff7eb!important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 7px 18px rgba(245,161,38,.10)!important;
+    }
+    div[class*="st-key-cfg_start_wrap"] button:hover{
+        background:linear-gradient(180deg,#f2a128,#d27b0c)!important;
+        border-color:#ffad36!important;
+    }
+
+    [data-testid="stDialog"] [role="dialog"]{
+        padding-top:.18rem!important;
+    }
+    
+
+    /* Dialog intro block: prevent stacking/overlap and create clear hierarchy */
+    div[class*="st-key-cfg_dialog_intro"]{
+        margin:.08rem 0 .46rem!important;
+        padding:.02rem 0 .04rem!important;
+    }
+    .cfg-dialog-expname{
+        color:#eef3f7!important;
+        font-size:1.06rem!important;
+        font-weight:760!important;
+        line-height:1.14!important;
+        letter-spacing:-.01em!important;
+        margin:0 0 .16rem!important;
+    }
+    .cfg-dialog-subcopy{
+        color:#8492a1!important;
+        font-size:.77rem!important;
+        line-height:1.28!important;
+        margin:0!important;
+    }
+
+    /* Keep headers clearly separated from the first row */
+    .st-key-configuration_table [data-testid="stVerticalBlock"]{
+        gap:.20rem!important;
+    }
+    .st-key-configuration_table [data-testid="stHorizontalBlock"]{
+        gap:.42rem!important;
+    }
+    .st-key-configuration_table .lab-config-header{
+        min-height:1.08rem!important;
+        padding:.02rem .14rem .16rem!important;
+        margin:0 0 .02rem!important;
+        color:#96a4b3!important;
+        font-size:.65rem!important;
+        font-weight:760!important;
+        letter-spacing:.08em!important;
+        text-transform:uppercase!important;
+        display:flex!important;
+        align-items:flex-end!important;
+    }
+
+    /* Row shell */
+    div[class*="st-key-cfg_row_shell_"]{
+        background:linear-gradient(180deg,rgba(13,24,36,.66),rgba(10,19,29,.66))!important;
+        border:1px solid rgba(137,160,184,.15)!important;
+        border-radius:10px!important;
+        padding:.22rem .26rem!important;
+        margin:.03rem 0!important;
+    }
+
+    /* Left index alignment */
+    .cfg-index-cell{
+        min-height:2.42rem!important;
+        display:flex!important;
+        align-items:center!important;
+        justify-content:flex-start!important;
+        padding-left:.18rem!important;
+        color:#edf2f6!important;
+        font-size:.86rem!important;
+        font-weight:740!important;
+        line-height:1!important;
+    }
+
+    .st-key-configuration_table input,
+    .st-key-configuration_table button{
+        min-height:2.42rem!important;
+        height:2.42rem!important;
+    }
+    .st-key-configuration_table input{
+        font-size:.85rem!important;
+    }
+
+    div[class*="st-key-cfg_remove_wrap_"] button{
+        min-height:2.42rem!important;
+        height:2.42rem!important;
+        border-radius:8px!important;
+        font-size:1.02rem!important;
+        font-weight:720!important;
+        padding:0!important;
+    }
+
+    /* Add mouse and footer buttons */
+    div[class*="st-key-cfg_add_mouse_wrap"]{
+        margin-top:.10rem!important;
+        margin-bottom:.10rem!important;
+    }
+    div[class*="st-key-cfg_add_mouse_wrap"] button{
+        min-height:2.94rem!important;
+        height:2.94rem!important;
+        border-radius:10px!important;
+        border:1px dashed rgba(137,160,184,.28)!important;
+        background:linear-gradient(180deg,rgba(17,29,42,.44),rgba(11,21,31,.44))!important;
+        color:#e2e8ee!important;
+        font-size:.86rem!important;
+        font-weight:700!important;
+    }
+
+    div[class*="st-key-cfg_cancel_wrap"] button,
+    div[class*="st-key-cfg_start_wrap"] button{
+        min-height:2.90rem!important;
+        height:2.90rem!important;
+        border-radius:10px!important;
+        font-size:.89rem!important;
+        font-weight:720!important;
+    }
+
+    /* Ensure the dialog itself has enough top breathing room */
+    [data-testid="stDialog"] [role="dialog"]{
+        padding-top:.22rem!important;
+    }
+    
+
+    /* Separate the anesthesia status/weight from the redose controls. */
+    .lab-anesthesia-copy{
+        min-height:2.28rem!important;
+        margin:0 0 .24rem 0!important;
+    }
+
+    div[class*="st-key-anesthesia_redose_action_"] button,
+    div[class*="st-key-anesthesia_delay_action_"] button{
+        margin-top:.08rem!important;
+    }
+
+    /* Keep the two anesthesia buttons visually grouped, but not crowded. */
+    div[class*="st-key-anesthesia_redose_action_"],
+    div[class*="st-key-anesthesia_delay_action_"]{
+        padding-top:.02rem!important;
+        padding-bottom:.02rem!important;
+    }
+    
+
+    /*
+      The previous layout let the weight line visually intrude into the button
+      row. Give the label, reminder, and weight three explicit rows and reserve
+      real vertical space before the controls.
+    */
+    .lab-anesthesia-copy{
+        display:grid!important;
+        grid-template-rows:auto auto auto!important;
+        row-gap:.12rem!important;
+        min-height:0!important;
+        height:auto!important;
+        justify-content:stretch!important;
+        align-content:start!important;
+        margin:0!important;
+        padding:0 0 .24rem 0!important;
+        overflow:visible!important;
+    }
+
+    .lab-anesthesia-copy .lab-mini-label{
+        margin:0!important;
+        padding:0!important;
+        line-height:1.05!important;
+    }
+
+    .lab-anesthesia-copy .lab-primary-text{
+        margin:0!important;
+        padding:0!important;
+        line-height:1.16!important;
+        white-space:nowrap!important;
+    }
+
+    .lab-anesthesia-weight{
+        color:#7f8c9a!important;
+        font-size:.65rem!important;
+        font-weight:560!important;
+        line-height:1.12!important;
+        margin:0!important;
+        padding:0!important;
+        white-space:nowrap!important;
+    }
+
+    div[class*="st-key-anesthesia_controls_"]{
+        margin-top:.18rem!important;
+        padding-top:.08rem!important;
+        padding-bottom:.02rem!important;
+    }
+
+    div[class*="st-key-anesthesia_controls_"] [data-testid="stHorizontalBlock"]{
+        gap:.58rem!important;
+    }
+
+    div[class*="st-key-anesthesia_redose_action_"],
+    div[class*="st-key-anesthesia_delay_action_"]{
+        padding:0!important;
+        margin:0!important;
+    }
+
+    div[class*="st-key-anesthesia_redose_action_"] button,
+    div[class*="st-key-anesthesia_delay_action_"] button{
+        margin:0!important;
+        min-height:1.90rem!important;
+        height:1.90rem!important;
+    }
+    
+
+    /* ---------- Subject identity / starting MAP ---------- */
+    .lab-subject-copy{
+        min-width:0!important;
+        display:flex!important;
+        flex-direction:column!important;
+        justify-content:center!important;
+    }
+
+    .lab-starting-map{
+        color:#7f8d9b!important;
+        font-size:.61rem!important;
+        font-weight:600!important;
+        line-height:1.08!important;
+        margin-top:.16rem!important;
+        white-space:nowrap!important;
+    }
+
+    /* ---------- Anesthesia status ---------- */
+    .lab-anesthesia-copy{
+        display:block!important;
+        min-height:0!important;
+        height:auto!important;
+        margin:0!important;
+        padding:0 0 .30rem 0!important;
+        overflow:visible!important;
+    }
+
+    .lab-anesthesia-copy .lab-mini-label{
+        margin:0 0 .18rem 0!important;
+        padding:0!important;
+        line-height:1!important;
+    }
+
+    .lab-anesthesia-status-row{
+        display:flex!important;
+        align-items:baseline!important;
+        justify-content:space-between!important;
+        gap:.55rem!important;
+        width:100%!important;
+        min-width:0!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-anesthesia-status-row .lab-primary-text{
+        min-width:0!important;
+        flex:1 1 auto!important;
+        margin:0!important;
+        padding:0!important;
+        line-height:1.10!important;
+        white-space:nowrap!important;
+        overflow:hidden!important;
+        text-overflow:ellipsis!important;
+    }
+
+    .lab-anesthesia-weight-inline{
+        flex:0 0 auto!important;
+        margin-left:auto!important;
+        padding:0!important;
+        color:#7f8c9a!important;
+        font-size:.64rem!important;
+        font-weight:580!important;
+        line-height:1!important;
+        white-space:nowrap!important;
+        text-align:right!important;
+    }
+
+    /* The old V48 weight row must not participate in layout if any
+       stale markup survives a rerun during development. */
+    .lab-anesthesia-weight{
+        display:none!important;
+    }
+
+    /* Explicit breathing room between status line and buttons. */
+    div[class*="st-key-anesthesia_controls_"]{
+        margin-top:.20rem!important;
+        padding-top:.04rem!important;
+        padding-bottom:.02rem!important;
+    }
+
+    div[class*="st-key-anesthesia_controls_"] [data-testid="stHorizontalBlock"]{
+        gap:.56rem!important;
+    }
+
+    div[class*="st-key-anesthesia_redose_action_"] button,
+    div[class*="st-key-anesthesia_delay_action_"] button{
+        margin:0!important;
+    }
+    
+
+    /* Make the weight visually equal to the redose timer text. */
+    .lab-anesthesia-weight-inline{
+        color:#eef2f5!important;
+        font-size:.79rem!important;
+        font-weight:680!important;
+        line-height:1.10!important;
+        white-space:nowrap!important;
+        text-align:right!important;
+    }
+
+    /* Add real breathing room before the Redose / Delay controls. */
+    .lab-anesthesia-copy{
+        padding-bottom:.52rem!important;
+    }
+
+    div[class*="st-key-anesthesia_controls_"]{
+        margin-top:.28rem!important;
+        padding-top:.06rem!important;
+    }
+    
+
+    /*
+      Give the timer/weight row a clearly separate visual band from
+      the Redose / Delay controls. The buttons are made slightly
+      shorter so the added whitespace does not unnecessarily inflate
+      the overall subject row.
+    */
+    .lab-anesthesia-copy{
+        padding-bottom:.72rem!important;
+    }
+
+    div[class*="st-key-anesthesia_controls_"]{
+        margin-top:.34rem!important;
+        padding-top:.06rem!important;
+        padding-bottom:.02rem!important;
+    }
+
+    div[class*="st-key-anesthesia_controls_"] [data-testid="stHorizontalBlock"]{
+        gap:.48rem!important;
+    }
+
+    div[class*="st-key-anesthesia_redose_action_"] button,
+    div[class*="st-key-anesthesia_delay_action_"] button{
+        min-height:1.66rem!important;
+        height:1.66rem!important;
+        padding:0 .30rem!important;
+        border-radius:7px!important;
+        font-size:.62rem!important;
+        font-weight:680!important;
+        margin:0!important;
+    }
+    
+
+    /*
+      The anesthesia/action side can make a subject card taller than the first
+      three columns. Explicitly stretch those columns and center their contents.
+    */
+    div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(1),
+    div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(2),
+    div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(3){
+        align-self:stretch!important;
+        display:flex!important;
+        flex-direction:column!important;
+        justify-content:center!important;
+    }
+
+    div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(1) > [data-testid="stVerticalBlock"],
+    div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(2) > [data-testid="stVerticalBlock"],
+    div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(3) > [data-testid="stVerticalBlock"]{
+        height:100%!important;
+        justify-content:center!important;
+    }
+
+    .lab-mouse-wrap,
+    .lab-cell{
+        justify-content:center!important;
+        margin-top:auto!important;
+        margin-bottom:auto!important;
+    }
+
+    .lab-starting-map{
+        color:#aab6c2!important;
+        font-size:.73rem!important;
+        font-weight:680!important;
+        line-height:1.12!important;
+        margin-top:.22rem!important;
+    }
+    
+
+    /*
+      Always reserve the Starting MAP line. Before a value exists the text is
+      invisible, so Mouse N never jumps when the MAP is later recorded.
+    */
+    .lab-starting-map{
+        min-height:.82rem!important;
+        height:.82rem!important;
+        display:block!important;
+        margin-top:.20rem!important;
+        font-size:.73rem!important;
+        line-height:.82rem!important;
+    }
+
+    .lab-starting-map-placeholder{
+        visibility:hidden!important;
+        user-select:none!important;
+    }
+
+    /*
+      Reminder audio is rendered by Streamlit so it uses the same browser path
+      as the working Settings sound preview. Hide only the player chrome.
+    */
+    div[class*="st-key-overdue_sound_"]{
+        position:absolute!important;
+        width:1px!important;
+        height:1px!important;
+        overflow:hidden!important;
+        opacity:.001!important;
+        pointer-events:none!important;
+    }
+
+    div[class*="st-key-overdue_sound_"] audio{
+        width:1px!important;
+        height:1px!important;
+    }
+    
+
+    /*
+      Mouse status dot, mouse icon, mouse name, Next Event value/timer,
+      and Total value now share the same vertical center line.
+    */
+    .lab-mouse-wrap{
+        position:relative!important;
+        align-items:center!important;
+        justify-content:flex-start!important;
+        margin-top:0!important;
+        margin-bottom:0!important;
+    }
+
+    .lab-mouse-identity{
+        align-items:center!important;
+    }
+
+    .lab-subject-copy{
+        position:relative!important;
+        display:flex!important;
+        align-items:center!important;
+        justify-content:center!important;
+        min-height:1.20rem!important;
+        height:1.20rem!important;
+    }
+
+    .lab-mouse-name{
+        line-height:1.20rem!important;
+        margin:0!important;
+    }
+
+    /*
+      MAP and Paused labels are annotations around the fixed subject-name
+      anchor; they never change the Mouse N position.
+    */
+    .lab-starting-map{
+        position:absolute!important;
+        top:1.30rem!important;
+        left:0!important;
+        margin:0!important;
+        min-height:.82rem!important;
+        height:.82rem!important;
+        line-height:.82rem!important;
+    }
+
+    .lab-paused-label{
+        position:absolute!important;
+        bottom:1.28rem!important;
+        left:0!important;
+        margin:0!important;
+    }
+
+    .lab-next-event-cell,
+    .lab-total-cell{
+        position:relative!important;
+        display:flex!important;
+        flex-direction:column!important;
+        justify-content:center!important;
+        min-height:3.70rem!important;
+        margin:0!important;
+    }
+
+    .lab-next-main,
+    .lab-total{
+        margin:0!important;
+        padding:0!important;
+        line-height:1.05!important;
+    }
+
+    /*
+      Labels float above the centered value instead of pushing the timer
+      downward. This is what aligns the actual timer/value with Mouse N.
+    */
+    .lab-next-single-label,
+    .lab-total-cell > .lab-mini-label{
+        position:absolute!important;
+        left:0!important;
+        bottom:calc(50% + .52rem)!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-next-overline{
+        position:absolute!important;
+        left:0!important;
+        bottom:calc(50% + .48rem)!important;
+        display:flex!important;
+        flex-direction:column!important;
+        gap:.10rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-next-overline .lab-mini-label,
+    .lab-next-overline .lab-next-caption{
+        margin:0!important;
+        padding:0!important;
+        line-height:1!important;
+    }
+
+    .lab-next-time{
+        margin:0!important;
+    }
+    
+
+    /* ---------------------------------------------------------
+       Subject identity
+       Keep a permanent two-line subject block so adding Starting
+       MAP never moves the mouse label, but center the NAME + MAP
+       combination as a whole within the row.
+       --------------------------------------------------------- */
+    .lab-subject-copy{
+        position:relative!important;
+        display:flex!important;
+        flex-direction:column!important;
+        align-items:flex-start!important;
+        justify-content:center!important;
+        min-height:2.30rem!important;
+        height:2.30rem!important;
+        gap:.20rem!important;
+    }
+
+    .lab-mouse-name{
+        line-height:1.08!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-starting-map{
+        position:static!important;
+        top:auto!important;
+        left:auto!important;
+        display:block!important;
+        min-height:.80rem!important;
+        height:.80rem!important;
+        line-height:.80rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-starting-map-placeholder{
+        visibility:hidden!important;
+    }
+
+    /* Keep pause as an annotation without disturbing the centered block. */
+    .lab-paused-label{
+        position:absolute!important;
+        left:0!important;
+        bottom:2.38rem!important;
+        margin:0!important;
+    }
+
+    /* ---------------------------------------------------------
+       Next event spacing
+       Move the entire Next Event content slightly to the right so
+       the subject identity and next-event groups do not crowd.
+       --------------------------------------------------------- */
+    .lab-next-event-cell{
+        padding-left:.42rem!important;
+        box-sizing:border-box!important;
+    }
+
+    .lab-next-overline{
+        left:.42rem!important;
+    }
+
+    .lab-next-single-label{
+        left:.42rem!important;
+    }
+
+    .lab-next-main{
+        margin-left:.42rem!important;
+    }
+
+    /* ---------------------------------------------------------
+       Redose state visibility
+       Normal = quiet orange outline.
+       Warning = stronger amber.
+       Overdue = unmistakable red/pink status + red Redose button.
+       Delay remains purple so the two actions stay visually distinct.
+       --------------------------------------------------------- */
+    div[class*="st-key-mouse_row_"]:has(.anesthesia-tone-orange)
+    div[class*="st-key-anesthesia_redose_action_"] button{
+        color:#ffd18a!important;
+        border-color:#f5a126!important;
+        background:rgba(245,161,38,.10)!important;
+        box-shadow:0 0 0 1px rgba(245,161,38,.12)!important;
+    }
+
+    div[class*="st-key-mouse_row_"]:has(.anesthesia-tone-orange)
+    .lab-anesthesia-status-row .lab-primary-text,
+    div[class*="st-key-mouse_row_"]:has(.anesthesia-tone-orange)
+    .lab-anesthesia-weight-inline{
+        color:#ffc15f!important;
+    }
+
+    div[class*="st-key-mouse_row_"]:has(.anesthesia-tone-red)
+    .lab-anesthesia-status-row .lab-primary-text,
+    div[class*="st-key-mouse_row_"]:has(.anesthesia-tone-red)
+    .lab-anesthesia-weight-inline{
+        color:#ff8798!important;
+        font-weight:760!important;
+    }
+
+    div[class*="st-key-mouse_row_"]:has(.anesthesia-tone-red)
+    div[class*="st-key-anesthesia_redose_action_"] button{
+        color:#fff1f3!important;
+        border-color:#ef6578!important;
+        background:linear-gradient(
+            180deg,
+            rgba(174,54,72,.86),
+            rgba(119,35,49,.86)
+        )!important;
+        box-shadow:
+            0 0 0 1px rgba(239,101,120,.20),
+            0 5px 14px rgba(239,101,120,.12)!important;
+    }
+
+    div[class*="st-key-mouse_row_"]:has(.anesthesia-tone-red)
+    div[class*="st-key-anesthesia_redose_action_"] button:hover{
+        background:linear-gradient(
+            180deg,
+            rgba(194,62,81,.94),
+            rgba(137,39,56,.94)
+        )!important;
+        border-color:#ff7d90!important;
+    }
+    
+
+    /*
+      Make the first three columns behave like consistent stacked blocks so
+      their internal horizontal guides line up across every row.
+    */
+
+    /* ---------- Subject column ---------- */
+    .lab-mouse-wrap{
+        min-height:3.20rem!important;
+        display:flex!important;
+        align-items:center!important;
+        justify-content:flex-start!important;
+        gap:.68rem!important;
+        margin:0!important;
+    }
+
+    .lab-mouse-identity{
+        display:flex!important;
+        align-items:center!important;
+        gap:.68rem!important;
+    }
+
+    .lab-subject-copy{
+        position:relative!important;
+        display:grid!important;
+        grid-template-rows:1.08rem .86rem!important;
+        align-content:center!important;
+        justify-items:start!important;
+        row-gap:.18rem!important;
+        min-height:2.34rem!important;
+        height:2.34rem!important;
+        margin:0!important;
+    }
+
+    .lab-mouse-name{
+        align-self:end!important;
+        line-height:1.06rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-starting-map{
+        position:static!important;
+        display:block!important;
+        align-self:start!important;
+        min-height:.86rem!important;
+        height:.86rem!important;
+        line-height:.86rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-starting-map-placeholder{
+        visibility:hidden!important;
+    }
+
+    .lab-paused-label{
+        position:absolute!important;
+        left:0!important;
+        bottom:2.46rem!important;
+        margin:0!important;
+    }
+
+    /* ---------- Next event column ---------- */
+    .lab-next-event-cell{
+        display:grid!important;
+        grid-template-rows:auto auto!important;
+        align-content:center!important;
+        justify-items:start!important;
+        row-gap:.18rem!important;
+        min-height:3.20rem!important;
+        padding-left:.50rem!important;
+        box-sizing:border-box!important;
+        margin:0!important;
+    }
+
+    .lab-next-overline{
+        position:static!important;
+        left:auto!important;
+        bottom:auto!important;
+        display:flex!important;
+        flex-direction:column!important;
+        gap:.10rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-next-single-label{
+        position:static!important;
+        left:auto!important;
+        bottom:auto!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-next-overline .lab-mini-label,
+    .lab-next-overline .lab-next-caption,
+    .lab-next-single-label{
+        line-height:1.00!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-next-main{
+        margin:0!important;
+        padding:0!important;
+        line-height:1.06!important;
+    }
+
+    /* ---------- Total column ---------- */
+    .lab-total-cell{
+        display:grid!important;
+        grid-template-rows:auto auto!important;
+        align-content:center!important;
+        justify-items:start!important;
+        row-gap:.18rem!important;
+        min-height:3.20rem!important;
+        margin:0!important;
+    }
+
+    .lab-total-cell > .lab-mini-label{
+        position:static!important;
+        left:auto!important;
+        bottom:auto!important;
+        margin:0!important;
+        padding:0!important;
+        line-height:1.00!important;
+    }
+
+    .lab-total{
+        margin:0!important;
+        padding:0!important;
+        line-height:1.06!important;
+    }
+
+    /* Remove old centering behavior that could fight the grid alignment. */
+    .lab-cell{
+        margin-top:0!important;
+        margin-bottom:0!important;
+    }
+    
+
+    /* ---------------------------------------------------------
+       SUBJECT
+       Two permanent rows:
+         Mouse N
+         Starting MAP (invisible placeholder until available)
+
+       Dot and mouse icon are anchored to the Mouse N row only.
+       --------------------------------------------------------- */
+    .lab-mouse-wrap{
+        min-height:2.34rem!important;
+        height:2.34rem!important;
+        display:flex!important;
+        align-items:flex-start!important;
+        justify-content:flex-start!important;
+        gap:.66rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-mouse-identity{
+        min-height:2.34rem!important;
+        height:2.34rem!important;
+        display:flex!important;
+        align-items:flex-start!important;
+        gap:.66rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-subject-copy{
+        display:grid!important;
+        grid-template-rows:1.08rem .86rem!important;
+        align-content:start!important;
+        justify-items:start!important;
+        row-gap:.18rem!important;
+        min-height:2.34rem!important;
+        height:2.34rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-mouse-name{
+        align-self:center!important;
+        line-height:1.08rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-starting-map{
+        position:static!important;
+        align-self:center!important;
+        min-height:.86rem!important;
+        height:.86rem!important;
+        line-height:.86rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-starting-map-placeholder{
+        visibility:hidden!important;
+    }
+
+    /* Center these against the Mouse N line, not the two-line subject block. */
+    .lab-dot{
+        flex:0 0 auto!important;
+        margin-top:.27rem!important;
+    }
+
+    .lab-mouse-icon{
+        flex:0 0 auto!important;
+        margin-top:-.31rem!important;
+    }
+
+    /* ---------------------------------------------------------
+       NEXT EVENT
+       Exactly two permanent rows for every state:
+         NEXT EVENT
+         event/value
+
+       This prevents the block from moving when a timer starts.
+       --------------------------------------------------------- */
+    .lab-next-event-cell{
+        display:grid!important;
+        grid-template-rows:.72rem 1.10rem!important;
+        align-content:center!important;
+        justify-items:start!important;
+        row-gap:.18rem!important;
+        min-height:2.34rem!important;
+        height:2.34rem!important;
+        margin:0!important;
+        padding:0 0 0 .50rem!important;
+        box-sizing:border-box!important;
+    }
+
+    .lab-next-event-cell > .lab-mini-label{
+        position:static!important;
+        align-self:end!important;
+        margin:0!important;
+        padding:0!important;
+        line-height:.72rem!important;
+    }
+
+    .lab-next-inline{
+        display:flex!important;
+        align-items:center!important;
+        gap:.28rem!important;
+        align-self:start!important;
+        min-width:0!important;
+        height:1.10rem!important;
+        line-height:1.10rem!important;
+        margin:0!important;
+        padding:0!important;
+        white-space:nowrap!important;
+    }
+
+    .lab-next-copy{
+        color:#dfe5eb!important;
+        font-size:.72rem!important;
+        font-weight:680!important;
+        line-height:1.10rem!important;
+        white-space:nowrap!important;
+    }
+
+    .lab-next-metric{
+        color:#eef2f5!important;
+        font-size:.98rem!important;
+        font-weight:760!important;
+        line-height:1.10rem!important;
+        white-space:nowrap!important;
+    }
+
+    .lab-next-metric.orange{color:#f5a126!important}
+    .lab-next-metric.red{color:#ff8798!important}
+    .lab-next-metric.green{color:#73dc87!important}
+    .lab-next-metric.gray{color:#8d99a6!important}
+
+    /* Kill old absolute-position rules from earlier versions. */
+    .lab-next-overline,
+    .lab-next-single-label{
+        position:static!important;
+        left:auto!important;
+        bottom:auto!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-next-main{
+        margin:0!important;
+        padding:0!important;
+    }
+
+    /* ---------------------------------------------------------
+       TOTAL
+       Same fixed two-row geometry as Next Event.
+       --------------------------------------------------------- */
+    .lab-total-cell{
+        display:grid!important;
+        grid-template-rows:.72rem 1.10rem!important;
+        align-content:center!important;
+        justify-items:start!important;
+        row-gap:.18rem!important;
+        min-height:2.34rem!important;
+        height:2.34rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    .lab-total-cell > .lab-mini-label{
+        position:static!important;
+        align-self:end!important;
+        margin:0!important;
+        padding:0!important;
+        line-height:.72rem!important;
+    }
+
+    .lab-total{
+        align-self:start!important;
+        height:1.10rem!important;
+        line-height:1.10rem!important;
+        margin:0!important;
+        padding:0!important;
+    }
+
+    /* Keep pause as an annotation, without changing the fixed subject grid. */
+    .lab-paused-label{
+        position:absolute!important;
+        left:0!important;
+        bottom:2.42rem!important;
+        margin:0!important;
+    }
+    
+
+    /*
+      The second row under NEXT EVENT now has one fixed typography
+      regardless of state: not started, countdown, warning, or overdue.
+      It matches the Starting MAP line under the subject name.
+    */
+    .lab-next-inline,
+    .lab-next-inline.lab-primary-text,
+    .lab-next-copy,
+    .lab-next-metric{
+        font-size:.73rem!important;
+        font-weight:680!important;
+        line-height:1.10rem!important;
+    }
+
+    .lab-next-inline{
+        height:1.10rem!important;
+        white-space:nowrap!important;
+    }
+
+    /* Preserve only the state color; never change size/weight by state. */
+    .lab-next-inline.gray,
+    .lab-next-metric.gray{
+        color:#8d99a6!important;
+    }
+
+    .lab-next-inline.green,
+    .lab-next-metric.green{
+        color:#73dc87!important;
+    }
+
+    .lab-next-inline.orange,
+    .lab-next-metric.orange{
+        color:#f5a126!important;
+    }
+
+    .lab-next-inline.red,
+    .lab-next-metric.red{
+        color:#ff8798!important;
+    }
+    
+"""
+
+
+def install_app_styles():
+    """Install the complete application stylesheet once per script rerun."""
+    st.markdown("<style>" + APP_CSS + "</style>", unsafe_allow_html=True)
+
+
+install_app_styles()
 
 # ============================================================
 # TIME / STATE HELPERS
@@ -205,7 +1883,10 @@ def format_phase_timer(seconds):
     total = rounded_seconds(seconds); minutes, secs = divmod(total, 60); return f"{minutes:02d}:{secs:02d}"
 
 def fixed_duration_label(value): return f"{value}{UNIT_SHORT}"
-def wall_datetime(epoch=None): return datetime.fromtimestamp(float(epoch if epoch is not None else time.time()), ZoneInfo(APP_TIMEZONE))
+def wall_datetime(epoch=None):
+    """Return an application-local datetime for an epoch (or the current time)."""
+    value = time.time() if epoch is None else float(epoch)
+    return datetime.fromtimestamp(value, APP_TZ)
 def elapsed_from(start, now): return 0.0 if start is None else max(0.0, float(now) - float(start))
 def remaining_from_start(start, duration_units, now): return None if start is None else float(start) + duration_to_seconds(duration_units) - float(now)
 
@@ -221,6 +1902,7 @@ def mouse_defaults(i):
         f"notification_sound_enabled_{i}":DEFAULT_NOTIFICATION_SOUND_ENABLED,
         f"notification_sound_{i}":DEFAULT_NOTIFICATION_SOUND,
         f"event_log_{i}":[], f"subject_name_{i}":f"Mouse {i}", f"mouse_weight_g_{i}":None,
+        f"starting_map_mmhg_{i}":None, f"ending_map_mmhg_{i}":None,
         f"display_order_{i}":i, f"undo_history_{i}":[],
     }
 
@@ -251,6 +1933,32 @@ def mouse_weight(i):
 
 def weight_label(i):
     v=mouse_weight(i); return "Weight —" if v is None or v <= 0 else f"{v:.1f} g"
+
+def _random_test_weight():
+    return round(random.uniform(TEST_WEIGHT_MIN_G, TEST_WEIGHT_MAX_G), 1)
+
+def _default_entry_weight():
+    return _random_test_weight() if TESTING_MODE else 0.0
+
+def starting_map(i):
+    try:
+        value=st.session_state.get(f"starting_map_mmhg_{i}")
+        return None if value is None else float(value)
+    except (TypeError,ValueError):
+        return None
+
+def ending_map(i):
+    try:
+        value=st.session_state.get(f"ending_map_mmhg_{i}")
+        return None if value is None else float(value)
+    except (TypeError,ValueError):
+        return None
+
+def _map_summary(i):
+    start=starting_map(i); end=ending_map(i); parts=[]
+    if start is not None: parts.append(f"Starting MAP {start:g} mmHg")
+    if end is not None: parts.append(f"Ending MAP {end:g} mmHg")
+    return " · ".join(parts)
 
 def ordered_subject_indices():
     return sorted(range(1,mouse_count()+1), key=lambda i:(float(st.session_state.get(f"display_order_{i}",i)),i))
@@ -460,6 +2168,124 @@ def relative_time_map(i,log):
 
 def is_backtime_editable_event(entry): return entry.get("Event") in {"Anesthesia started","Anesthesia redosed","Board acclimation started","Shock started","Resuscitation started"}
 
+def backtime_start_event(i,event_id,amount):
+    try: amount=float(amount)
+    except (TypeError,ValueError): return False,f"Enter a valid number of {UNIT_WORD}."
+    if amount<=0: return False,f"Back-time must be greater than 0 {UNIT_WORD}."
+    key=f"event_log_{i}"; log=list(st.session_state.get(key,[])); idx=next((n for n,e in enumerate(log) if e.get("_id")==event_id),None)
+    if idx is None: return False,"That event could not be found."
+    entry=dict(log[idx])
+    if not is_backtime_editable_event(entry): return False,"That event is not a timer start and cannot be back-timed here."
+    old=event_epoch(entry)
+    if old is None: return False,"The saved event time could not be parsed."
+    new=old-duration_to_seconds(amount); name=entry.get("Event"); _record_global_undo(f"Back-time {name} — {subject_name(i)}",[i]); entry["_epoch"]=new; entry["Absolute time"]=wall_datetime(new).strftime("%Y-%m-%d %H:%M:%S"); log[idx]=entry; st.session_state[key]=log
+    if name=="Board acclimation started": st.session_state[f"board_start_{i}"]=new
+    elif name=="Shock started": st.session_state[f"shock_start_{i}"]=new; st.session_state[f"shock_wallclock_{i}"]=wall_datetime(new).strftime("%H:%M:%S")
+    elif name=="Resuscitation started": st.session_state[f"resus_start_{i}"]=new
+    elif name in ("Anesthesia started","Anesthesia redosed"):
+        ae=[x for x in log if x.get("Event") in ("Anesthesia started","Anesthesia redosed")]
+        if ae and ae[-1].get("_id")==event_id: st.session_state[f"anesthesia_start_{i}"]=new
+        if name=="Anesthesia started":
+            cur=st.session_state.get(f"experiment_start_{i}")
+            if cur is None or new<float(cur): st.session_state[f"experiment_start_{i}"]=new
+    log_event(i,"Time correction",f"{name} moved {amount:g} {UNIT_WORD} earlier"); persist_subject(i); clear_mouse_alerts(i); st.session_state["_needs_full_rerun"]=True; return True,None
+
+def _anesthesia_event_weight(i,event):
+    """Return the weight associated with an anesthesia event."""
+    try:
+        value=event.get("_weight_g")
+        if value is not None:
+            return float(value)
+    except (TypeError,ValueError):
+        pass
+
+    # V53+ writes a readable weight into Details too. This fallback also
+    # supports events created just before upgrading to V53.
+    details=str(event.get("Details",""))
+    if details.startswith("Weight ") and details.endswith(" g"):
+        try:
+            return float(details[len("Weight "):-2].strip())
+        except (TypeError,ValueError):
+            pass
+
+    # Legacy events did not snapshot the event-time weight. Use the current
+    # saved subject weight rather than leaving the summary blank.
+    return mouse_weight(i)
+
+
+def anesthesia_summary_rows(i):
+    log=list(st.session_state.get(f"event_log_{i}",[]))
+    rel=relative_time_map(i,log)
+    rows=[]
+    dose_number=0
+
+    for order,event in enumerate(log):
+        event_name=str(event.get("Event",""))
+        if event_name not in ("Anesthesia started","Anesthesia redosed"):
+            continue
+
+        dose_number += 1
+        weight=_anesthesia_event_weight(i,event)
+        rows.append({
+            "dose":dose_number,
+            "type":"Initial" if event_name=="Anesthesia started" else "Redose",
+            "relative":rel.get(event.get("_id"),rel.get(f"__order_{order}","—")),
+            "absolute":str(event.get("Absolute time","")),
+            "weight":"—" if weight is None else f"{weight:.1f} g",
+        })
+
+    return rows
+
+def _append_payload_event(payload,i,event_name,details,epoch):
+    key=f"event_log_{i}"; log=list(payload.get(key,[])); log.append({"_id":uuid.uuid4().hex,"Event":event_name,"Absolute time":wall_datetime(epoch).strftime("%Y-%m-%d %H:%M:%S"),"Details":details,"_epoch":float(epoch)}); payload[key]=log
+
+def end_experiment_record(exp_id):
+    rows=get_subject_records(exp_id); now=time.time(); payloads={}
+    for row in rows:
+        i=int(row["mouse_index"])
+        try: p=json.loads(row["state_json"])
+        except Exception: p=_default_subject_payload(i)
+        if not bool(p.get(f"ended_{i}",False)):
+            p[f"ended_{i}"]=True; p[f"end_time_{i}"]=p.get(f"pause_started_{i}") or now; p[f"paused_{i}"]=False; p[f"pause_started_{i}"]=None; _append_payload_event(p,i,"Experiment ended","Ended from experiment management",now)
+        payloads[i]=p
+    _bulk_update_subject_payloads(exp_id,payloads,now,completed_at=now)
+
+def maybe_mark_experiment_complete():
+    if not all(is_ended(i) for i in range(1,mouse_count()+1)): return
+    exp_id=st.session_state.get("_active_experiment_id")
+    if exp_id:
+        now=time.time(); _db_execute("UPDATE experiments SET completed_at=COALESCE(completed_at,?),updated_at=? WHERE id=?",(now,now,exp_id))
+
+# ============================================================
+# EVENT LOG / TIMESHEETS
+# ============================================================
+
+def log_event(i,event_name,details="",when_epoch=None):
+    epoch=float(when_epoch if when_epoch is not None else time.time()); key=f"event_log_{i}"; log=list(st.session_state.get(key,[])); entry={"_id":uuid.uuid4().hex,"Event":str(event_name),"Absolute time":wall_datetime(epoch).strftime("%Y-%m-%d %H:%M:%S"),"Details":str(details or ""),"_epoch":epoch}; log.append(entry); st.session_state[key]=log; return entry
+
+def event_epoch(entry):
+    try:
+        if entry.get("_epoch") is not None: return float(entry["_epoch"])
+    except (TypeError,ValueError): pass
+    absolute=str(entry.get("Absolute time","")).strip()
+    if not absolute: return None
+    try: return datetime.strptime(absolute,"%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo(APP_TIMEZONE)).timestamp()
+    except ValueError: return None
+
+def _format_relative(seconds):
+    sign="-" if seconds<0 else "+"; seconds=abs(seconds); return sign+format_total_elapsed(seconds)
+
+def relative_time_map(i,log):
+    base=st.session_state.get(f"experiment_start_{i}")
+    epochs=[event_epoch(e) for e in log if event_epoch(e) is not None]
+    if base is None and epochs: base=min(epochs)
+    result={}
+    for order,e in enumerate(log):
+        ep=event_epoch(e); value="—" if ep is None or base is None else _format_relative(ep-float(base)); key=e.get("_id") or f"__order_{order}"; result[key]=value
+    return result
+
+def is_backtime_editable_event(entry): return entry.get("Event") in {"Anesthesia started","Anesthesia redosed","Board acclimation started","Shock started","Resuscitation started"}
+
 def backtime_start_event(i,event_id,minutes):
     try: minutes=float(minutes)
     except (TypeError,ValueError): return False,"Enter a valid number of minutes."
@@ -483,14 +2309,71 @@ def backtime_start_event(i,event_id,minutes):
     log_event(i,"Time correction",f"{name} moved {minutes:g} min earlier"); persist_subject(i); clear_mouse_alerts(i); st.session_state["_needs_full_rerun"]=True; return True,None
 
 def build_all_timesheets_text():
-    lines=["Shock Timer - Aggregated Timesheets",f"Experiment: {st.session_state.get('_active_experiment_name','')}",f"Timezone: {APP_TIMEZONE}",f"Exported: {wall_datetime().strftime('%Y-%m-%d %H:%M:%S')}",""]
-    for i in ordered_subject_indices():
-        lines += ["="*96,f"{subject_name(i)} (Mouse {i}; {weight_label(i)})","="*96]; log=list(st.session_state.get(f"event_log_{i}",[])); rel=relative_time_map(i,log)
-        if not log: lines.append("No events recorded.")
-        else: lines += ["Relative time | Absolute time        | Event | Details","-"*96]
+    """Build the complete text export using one stable subject ordering."""
+    indices = ordered_subject_indices()
+    lines=[
+        "Shock Timer - Aggregated Timesheets",
+        f"Experiment: {st.session_state.get('_active_experiment_name','')}",
+        f"Timezone: {APP_TIMEZONE}",
+        f"Exported: {wall_datetime().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "BLOOD PRESSURE SUMMARY",
+        "-"*96,
+        "Subject | Weight | Starting MAP | Ending MAP",
+    ]
+
+    for i in indices:
+        start=starting_map(i)
+        end=ending_map(i)
+        lines.append(
+            f"{subject_name(i)} | {weight_label(i)} | "
+            f"{'—' if start is None else f'{start:g} mmHg'} | "
+            f"{'—' if end is None else f'{end:g} mmHg'}"
+        )
+
+    lines += [
+        "",
+        "ANESTHESIA SUMMARY",
+        "-"*96,
+        "Subject | Dose | Type | Relative time | Absolute time | Weight",
+    ]
+
+    any_anesthesia=False
+    for i in indices:
+        for row in anesthesia_summary_rows(i):
+            any_anesthesia=True
+            lines.append(
+                f"{subject_name(i)} | {row['dose']} | {row['type']} | "
+                f"{row['relative']} | {row['absolute']} | {row['weight']}"
+            )
+    if not any_anesthesia:
+        lines.append("No anesthesia administrations recorded.")
+
+    lines += ["", "DETAILED SUBJECT TIMESHEETS", ""]
+
+    for i in indices:
+        lines += ["="*96,f"{subject_name(i)} (Mouse {i}; {weight_label(i)})","="*96]
+        map_summary=_map_summary(i)
+        if map_summary:
+            lines.append(map_summary)
+
+        log=list(st.session_state.get(f"event_log_{i}",[]))
+        rel=relative_time_map(i,log)
+
+        if not log:
+            lines.append("No events recorded.")
+        else:
+            lines += ["Relative time | Absolute time        | Event | Details","-"*96]
+
         for order,e in enumerate(log):
-            r=rel.get(e.get("_id"),rel.get(f"__order_{order}","—")); line=f"{r:>13} | {e.get('Absolute time','')} | {e.get('Event','')}"; details=str(e.get("Details","")).strip(); lines.append(line+(f" | {details}" if details else ""))
+            r=rel.get(e.get("_id"),rel.get(f"__order_{order}","—"))
+            line=f"{r:>13} | {e.get('Absolute time','')} | {e.get('Event','')}"
+            details=str(e.get("Details","")).strip()
+            lines.append(line+(f" | {details}" if details else ""))
+
         lines.append("")
+    return "\n".join(lines).rstrip()+"\n"
+
     return "\n".join(lines).rstrip()+"\n"
 
 # ============================================================
@@ -584,17 +2467,45 @@ def undo_last_stage_action(i):
     if action=="anesthesia_redose":
         s=item.get("snapshot") or {}; st.session_state[f"anesthesia_start_{i}"]=s.get("anesthesia_start"); st.session_state[f"anesthesia_due_override_{i}"]=s.get("anesthesia_due_override"); st.session_state[f"anesthesia_dose_count_{i}"]=int(s.get("anesthesia_dose_count",1))
     elif action=="start_resus": st.session_state[f"resus_start_{i}"]=None
-    elif action=="start_shock": st.session_state[f"shock_start_{i}"]=None; st.session_state[f"shock_wallclock_{i}"]=None
+    elif action=="start_shock":
+        st.session_state[f"shock_start_{i}"]=None; st.session_state[f"shock_wallclock_{i}"]=None; st.session_state[f"starting_map_mmhg_{i}"]=None
     elif action=="start_board": st.session_state[f"board_start_{i}"]=None
     st.session_state[key]=h; clear_mouse_alerts(i); log_event(i,"Undo",f"Reverted {_undo_label(action)}"); persist_subject(i); st.session_state["_needs_full_rerun"]=True; return True
 
 def start_or_redose_anesthesia(i):
     if not mouse_is_running(i): return
-    now=time.time(); previous=st.session_state.get(f"anesthesia_start_{i}"); first=previous is None; _record_global_undo(f"{'Start anesthesia' if first else 'Anesthesia redose'} — {subject_name(i)}",[i]); snap=None
-    if not first: snap={"anesthesia_start":previous,"anesthesia_due_override":st.session_state.get(f"anesthesia_due_override_{i}"),"anesthesia_dose_count":anesthesia_dose_count(i)}
-    ensure_experiment_started(i,now); st.session_state[f"anesthesia_start_{i}"]=now; st.session_state[f"anesthesia_due_override_{i}"]=None; st.session_state[f"anesthesia_dose_count_{i}"]=1 if first else anesthesia_dose_count(i)+1; event=log_event(i,"Anesthesia started" if first else "Anesthesia redosed",when_epoch=now)
-    if not first: _push_undo(i,"anesthesia_redose",event,snapshot=snap)
-    clear_alert(i,"Anesthesia redose"); persist_subject(i)
+    now=time.time()
+    previous=st.session_state.get(f"anesthesia_start_{i}")
+    first=previous is None
+    _record_global_undo(f"{'Start anesthesia' if first else 'Anesthesia redose'} — {subject_name(i)}",[i])
+    snap=None
+    if not first:
+        snap={
+            "anesthesia_start":previous,
+            "anesthesia_due_override":st.session_state.get(f"anesthesia_due_override_{i}"),
+            "anesthesia_dose_count":anesthesia_dose_count(i),
+        }
+
+    ensure_experiment_started(i,now)
+    st.session_state[f"anesthesia_start_{i}"]=now
+    st.session_state[f"anesthesia_due_override_{i}"]=None
+    st.session_state[f"anesthesia_dose_count_{i}"]=1 if first else anesthesia_dose_count(i)+1
+
+    dose_weight=mouse_weight(i)
+    weight_detail="Weight —" if dose_weight is None else f"Weight {dose_weight:.1f} g"
+    event=log_event(
+        i,
+        "Anesthesia started" if first else "Anesthesia redosed",
+        weight_detail,
+        when_epoch=now,
+    )
+    event["_weight_g"]=dose_weight
+
+    if not first:
+        _push_undo(i,"anesthesia_redose",event,snapshot=snap)
+
+    clear_alert(i,"Anesthesia redose")
+    persist_subject(i)
 
 def delay_anesthesia_reminder(i):
     if not mouse_is_running(i) or st.session_state.get(f"anesthesia_start_{i}") is None: return
@@ -609,6 +2520,8 @@ def start_shock(i,force=False):
     now=time.time()
     if st.session_state.get(f"shock_start_{i}") is not None or st.session_state.get(f"board_start_{i}") is None or (not force and not board_is_complete(i,now)): return
     _record_global_undo(f"{'Force start shock' if force else 'Start shock'} — {subject_name(i)}",[i]); ensure_experiment_started(i,now); st.session_state[f"shock_start_{i}"]=now; st.session_state[f"shock_wallclock_{i}"]=wall_datetime(now).strftime("%H:%M:%S"); event=log_event(i,"Shock started","Forced advance before board acclimation completed" if force else "",when_epoch=now); _push_undo(i,"start_shock",event); clear_alert(i,"Shock"); persist_subject(i)
+    st.session_state["_pending_dialog"]={"mouse":int(i),"kind":"starting_map"}
+    st.session_state["_needs_full_rerun"]=True
 
 def start_resuscitation(i,force=False):
     if not mouse_is_running(i): return
@@ -629,20 +2542,32 @@ def toggle_pause(i):
         st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; log_event(i,"Resumed",f"Paused {format_timer(delta)}",when_epoch=now)
     clear_mouse_alerts(i); persist_subject(i)
 
-def end_mouse(i,forced=False):
+def end_mouse(i,forced=False,ending_map_mmhg=None):
     if is_ended(i): return False
-    now=time.time(); _record_global_undo(f"{'Force end subject' if forced else 'End subject'} — {subject_name(i)}",[i]); end_at=st.session_state.get(f"pause_started_{i}") or now; st.session_state[f"ended_{i}"]=True; st.session_state[f"end_time_{i}"]=end_at; st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; clear_mouse_alerts(i); log_event(i,"Experiment ended","Forced advance before resuscitation completed" if forced else "",when_epoch=now); persist_subject(i); maybe_mark_experiment_complete(); return True
+    # If the subject has entered resuscitation, an ending MAP is required
+    # before the subject can be marked ended/completed.
+    if st.session_state.get(f"resus_start_{i}") is not None and ending_map_mmhg is None:
+        return False
+    now=time.time(); _record_global_undo(f"{'Force end subject' if forced else 'End subject'} — {subject_name(i)}",[i]); end_at=st.session_state.get(f"pause_started_{i}") or now
+    if ending_map_mmhg is not None:
+        st.session_state[f"ending_map_mmhg_{i}"]=float(ending_map_mmhg)
+        log_event(i,"Ending MAP",f"{float(ending_map_mmhg):g} mmHg",when_epoch=now)
+    st.session_state[f"ended_{i}"]=True; st.session_state[f"end_time_{i}"]=end_at; st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; clear_mouse_alerts(i); log_event(i,"Experiment ended","Forced advance before resuscitation completed" if forced else "",when_epoch=now); persist_subject(i); maybe_mark_experiment_complete(); return True
 
 def reset_mouse(i):
     _record_global_undo(f"Reset subject — {subject_name(i)}",[i]); name=subject_name(i); weight=mouse_weight(i); order=st.session_state.get(f"display_order_{i}",i); init=st.session_state.get(f"anesthesia_initial_duration_{i}",DEFAULT_INITIAL_ANESTHESIA); sub=st.session_state.get(f"anesthesia_duration_{i}",DEFAULT_SUBSEQUENT_ANESTHESIA); delay=st.session_state.get(f"anesthesia_delay_duration_{i}",DEFAULT_ANESTHESIA_DELAY); snd=st.session_state.get(f"notification_sound_{i}",DEFAULT_NOTIFICATION_SOUND); enabled=st.session_state.get(f"notification_sound_enabled_{i}",DEFAULT_NOTIFICATION_SOUND_ENABLED)
     for k,v in mouse_defaults(i).items(): st.session_state[k]=_copy_value(v)
     st.session_state[f"subject_name_{i}"]=name; st.session_state[f"mouse_weight_g_{i}"]=weight; st.session_state[f"display_order_{i}"]=order; st.session_state[f"anesthesia_initial_duration_{i}"]=init; st.session_state[f"anesthesia_duration_{i}"]=sub; st.session_state[f"anesthesia_delay_duration_{i}"]=delay; st.session_state[f"notification_sound_{i}"]=snd; st.session_state[f"notification_sound_enabled_{i}"]=enabled; clear_mouse_alerts(i); persist_subject(i); _sync_experiment_completion_from_session()
 
-def end_all_subjects_current_experiment():
+def end_all_subjects_current_experiment(ending_maps=None):
     targets=[i for i in ordered_subject_indices() if not is_ended(i)]
     if not targets: return True
+    ending_maps={int(k):float(v) for k,v in (ending_maps or {}).items()}
     _record_global_undo("End all subjects",targets); now=time.time()
     for i in targets:
+        if i in ending_maps:
+            st.session_state[f"ending_map_mmhg_{i}"]=ending_maps[i]
+            log_event(i,"Ending MAP",f"{ending_maps[i]:g} mmHg",when_epoch=now)
         st.session_state[f"ended_{i}"]=True; st.session_state[f"end_time_{i}"]=st.session_state.get(f"pause_started_{i}") or now; st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; clear_mouse_alerts(i); log_event(i,"Experiment ended","Ended with End all subjects",when_epoch=now)
     ok=persist_subjects(targets)
     if ok:
@@ -695,8 +2620,11 @@ def create_mouse_subject(name,weight):
     st.session_state["_needs_full_rerun"]=True; return True,None
 
 def mouse_is_complete(i,now):
-    if is_ended(i): return True
-    s=st.session_state.get(f"resus_start_{i}"); return s is not None and remaining_from_start(s,FIXED_RESUSCITATION_DURATION,now)<=0
+    # Completing the resuscitation timer makes the End action due, but it does
+    # NOT complete the subject. A subject moves to Completed / Ended only after
+    # the user explicitly ends it. Normal post-resuscitation ending is gated by
+    # the ending-MAP dialog before end_mouse() is called.
+    return is_ended(i)
 
 def _reorder_group(i,now): return "completed" if mouse_is_complete(i,effective_now(i,now)) else "active"
 def move_subject(i,direction):
@@ -715,7 +2643,7 @@ def _clear_configuration():
         if key.startswith("_cfg_name_") or key.startswith("_cfg_weight_"): st.session_state.pop(key,None)
     for key in ("_configuration_draft","_configuration_experiment_name","_show_configuration_dialog","_configuration_error"): st.session_state.pop(key,None)
 
-def _new_draft_mouse(number): return {"draft_id":uuid.uuid4().hex,"name":f"Mouse {number}","weight_g":0.0}
+def _new_draft_mouse(number): return {"draft_id":uuid.uuid4().hex,"name":f"Mouse {number}","weight_g":_default_entry_weight()}
 
 def begin_experiment_configuration(experiment_name,subject_count):
     name=(experiment_name or "").strip()
@@ -732,42 +2660,105 @@ def _sync_cfg_from_widgets():
 
 @st.dialog("Configure experiment",width="large")
 def configure_experiment_dialog():
-    name=st.session_state.get("_configuration_experiment_name",""); st.markdown(f"### {html.escape(name)}",unsafe_allow_html=True); st.caption("Confirm each mouse name and weight before starting the experiment.")
+    name=st.session_state.get("_configuration_experiment_name","")
     draft=list(st.session_state.get("_configuration_draft",[]))
+
+    with st.container(key="cfg_dialog_intro"):
+        st.markdown(f'<div class="cfg-dialog-expname">{html.escape(str(name))}</div>',unsafe_allow_html=True)
+        st.markdown(
+            '<div class="cfg-dialog-subcopy">Confirm each mouse name and weight before starting the experiment.</div>',
+            unsafe_allow_html=True,
+        )
+
     with st.container(key="configuration_table"):
-        hdr=st.columns([.6,3.4,1.5,.55]);
-        for col,label in zip(hdr,["#","Mouse name","Weight (g)",""]):
-            with col: st.markdown(f'<div class="lab-config-header">{label}</div>',unsafe_allow_html=True)
+        header_cols=st.columns(CONFIGURATION_COLUMNS, vertical_alignment="bottom")
+        for col,label in zip(header_cols,["#","Mouse name","Weight (g)",""]):
+            with col:
+                st.markdown(f'<div class="lab-config-header">{label}</div>',unsafe_allow_html=True)
+
         remove=None
         for idx,row in enumerate(draft,start=1):
-            did=row["draft_id"]; nk=f"_cfg_name_{did}"; wk=f"_cfg_weight_{did}"; st.session_state.setdefault(nk,row.get("name",f"Mouse {idx}")); st.session_state.setdefault(wk,float(row.get("weight_g",0.0))); cols=st.columns([.6,3.4,1.5,.55],vertical_alignment="center")
-            with cols[0]: st.markdown(f"**{idx}**")
-            with cols[1]: st.text_input("Name",key=nk,label_visibility="collapsed")
-            with cols[2]: st.number_input("Weight",min_value=0.0,max_value=100.0,step=.1,format="%.1f",key=wk,label_visibility="collapsed")
-            with cols[3]:
-                if len(draft)>1 and st.button("×",key=f"cfg_remove_{did}",use_container_width=True): remove=did
+            did=row["draft_id"]
+            nk=f"_cfg_name_{did}"
+            wk=f"_cfg_weight_{did}"
+
+            if nk not in st.session_state:
+                st.session_state[nk]=row.get("name",f"Mouse {idx}")
+            if wk not in st.session_state:
+                st.session_state[wk]=float(row.get("weight_g",0.0) or 0.0)
+
+            with st.container(key=f"cfg_row_shell_{did}"):
+                cols=st.columns(CONFIGURATION_COLUMNS, vertical_alignment="center")
+                with cols[0]:
+                    st.markdown(f'<div class="cfg-index-cell">{idx}</div>',unsafe_allow_html=True)
+                with cols[1]:
+                    st.text_input("Mouse name",key=nk,label_visibility="collapsed")
+                with cols[2]:
+                    st.number_input(
+                        "Weight (g)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        step=.1,
+                        format="%.1f",
+                        key=wk,
+                        label_visibility="collapsed",
+                    )
+                with cols[3]:
+                    with st.container(key=f"cfg_remove_wrap_{did}"):
+                        if len(draft)>1 and st.button("×",key=f"cfg_remove_{did}",use_container_width=True):
+                            remove=did
+
         if remove:
-            _sync_cfg_from_widgets(); st.session_state["_configuration_draft"]=[r for r in st.session_state["_configuration_draft"] if r["draft_id"]!=remove]; st.rerun()
-    if st.button("+ Add mouse",key="cfg_add_mouse",use_container_width=True):
-        current=_sync_cfg_from_widgets(); current.append(_new_draft_mouse(len(current)+1)); st.session_state["_configuration_draft"]=current; st.rerun()
+            _sync_cfg_from_widgets()
+            st.session_state["_configuration_draft"]=[
+                r for r in st.session_state.get("_configuration_draft",[]) if r["draft_id"]!=remove
+            ]
+            st.rerun()
+
+    with st.container(key="cfg_add_mouse_wrap"):
+        if st.button("+ Add mouse",key="cfg_add_mouse",use_container_width=True):
+            current=_sync_cfg_from_widgets()
+            current.append(_new_draft_mouse(len(current)+1))
+            st.session_state["_configuration_draft"]=current
+            st.rerun()
+
     error=st.session_state.pop("_configuration_error",None)
-    if error: st.error(error)
+    if error:
+        st.error(error)
+
     left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key="cfg_cancel",use_container_width=True): _clear_configuration(); st.rerun()
+        with st.container(key="cfg_cancel_wrap"):
+            if st.button("Cancel",key="cfg_cancel",use_container_width=True):
+                _clear_configuration()
+                st.rerun()
     with right:
-        if st.button("Start experiment",key="cfg_start",use_container_width=True,type="primary"):
-            current=_sync_cfg_from_widgets(); configured=[]; errors=[]
-            for idx,row in enumerate(current,start=1):
-                n,w,e=validate_mouse_name_weight(row.get("name"),row.get("weight_g"),f"Mouse {idx}")
-                if e: errors.append(e)
-                else: configured.append({"name":n,"weight_g":w})
-            if errors: st.session_state["_configuration_error"]=" ".join(errors); st.rerun()
-            atypical=[x for x in configured if weight_requires_confirmation(x["weight_g"])]
-            if atypical: queue_weight_warning("configuration",configured); st.rerun()
-            try:
-                exp_id=create_experiment_record(name,configured); _clear_configuration(); load_experiment_into_session(exp_id); st.rerun()
-            except Exception as exc: st.error(f"Could not create experiment: {exc}")
+        with st.container(key="cfg_start_wrap"):
+            if st.button("Start experiment",key="cfg_start",use_container_width=True,type="primary"):
+                current=_sync_cfg_from_widgets()
+                configured=[]
+                errors=[]
+                for idx,row in enumerate(current,start=1):
+                    n,w,e=validate_mouse_name_weight(row.get("name"),row.get("weight_g"),f"Mouse {idx}")
+                    if e:
+                        errors.append(e)
+                    else:
+                        configured.append({"name":n,"weight_g":w})
+                if errors:
+                    st.session_state["_configuration_error"]=" ".join(errors)
+                    st.rerun()
+                atypical=[x for x in configured if weight_requires_confirmation(x["weight_g"])]
+                if atypical:
+                    queue_weight_warning("configuration",configured)
+                    st.rerun()
+                try:
+                    exp_id=create_experiment_record(name,configured)
+                    _clear_configuration()
+                    load_experiment_into_session(exp_id)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not create experiment: {exc}")
+
 
 @st.dialog("Confirm mouse weight")
 def weight_warning_dialog():
@@ -825,50 +2816,177 @@ def delete_experiment_dialog(exp_id,exp_name):
         if st.button("Delete permanently",key=f"delete_exp_confirm_{exp_id}",use_container_width=True,type="primary"): delete_experiment_record(exp_id); st.rerun()
 
 def _render_experiment_card(exp,completed):
-    exp_id,name=str(exp["id"]),str(exp["name"]); widths=[4.6,1.1,.95,.88] if completed else [4.2,1.1,.95,.82,.88]
-    with st.container(border=True):
+    exp_id,name=str(exp["id"]),str(exp["name"])
+    card_key=f"home_exp_card_{'completed' if completed else 'active'}_{exp_id}"
+
+    with st.container(key=card_key):
+        widths=[5.2,1.05,.98,.92] if completed else [4.8,1.05,.98,.88,.92]
         cols=st.columns(widths,vertical_alignment="center")
-        with cols[0]: st.markdown(f"**{html.escape(name)}**",unsafe_allow_html=True); st.caption(f"{int(exp['mouse_count'])} mice · Last saved {_fmt_epoch(exp['updated_at'])}")
+
+        with cols[0]:
+            status_html=(
+                '<span class="home-exp-status completed">✓</span>'
+                if completed else
+                '<span class="home-exp-status"></span>'
+            )
+            st.markdown(
+                '<div class="home-exp-info">'
+                f'{status_html}'
+                '<div class="home-exp-text">'
+                f'<div class="home-exp-name">{html.escape(name)}</div>'
+                f'<div class="home-exp-meta">{int(exp["mouse_count"])} mice · Last saved {_fmt_epoch(exp["updated_at"])}</div>'
+                '</div></div>',
+                unsafe_allow_html=True,
+            )
+
         with cols[1]:
-            if st.button("Open" if completed else "Resume",key=f"open_exp_{exp_id}",use_container_width=True,type="primary" if not completed else "secondary"):
-                if load_experiment_into_session(exp_id): st.rerun()
+            if st.button(
+                "Open" if completed else "Resume",
+                key=f"open_exp_{exp_id}",
+                use_container_width=True,
+            ):
+                if load_experiment_into_session(exp_id):
+                    st.rerun()
                 st.error("Experiment could not be loaded.")
+
         with cols[2]:
-            if st.button("Rename",key=f"rename_exp_{exp_id}",use_container_width=True): rename_experiment_dialog(exp_id,name)
+            if st.button(
+                "Rename",
+                key=f"rename_exp_{exp_id}",
+                use_container_width=True,
+            ):
+                rename_experiment_dialog(exp_id,name)
+
         if completed:
             with cols[3]:
-                if st.button("Delete",key=f"delete_exp_{exp_id}",use_container_width=True): delete_experiment_dialog(exp_id,name)
+                with st.container(key=f"home_delete_{exp_id}"):
+                    if st.button(
+                        "Delete",
+                        key=f"delete_exp_{exp_id}",
+                        use_container_width=True,
+                    ):
+                        delete_experiment_dialog(exp_id,name)
         else:
             with cols[3]:
-                if st.button("End",key=f"end_exp_{exp_id}",use_container_width=True): end_experiment_home_dialog(exp_id,name)
+                if st.button(
+                    "End",
+                    key=f"end_exp_{exp_id}",
+                    use_container_width=True,
+                ):
+                    end_experiment_home_dialog(exp_id,name)
             with cols[4]:
-                if st.button("Delete",key=f"delete_exp_{exp_id}",use_container_width=True): delete_experiment_dialog(exp_id,name)
+                with st.container(key=f"home_delete_{exp_id}"):
+                    if st.button(
+                        "Delete",
+                        key=f"delete_exp_{exp_id}",
+                        use_container_width=True,
+                    ):
+                        delete_experiment_dialog(exp_id,name)
 
 def render_experiment_home():
-    st.markdown('<div class="lab-header-title" style="font-size:2.05rem;margin-top:.4rem;">Shock Timer</div>',unsafe_allow_html=True); st.caption("Create a new experiment or resume a saved session.")
-    if DATABASE_KIND=="postgres": st.success("Persistent cloud storage connected.")
-    else: st.warning("Local SQLite storage is active. Configure SHOCK_TIMER_DATABASE_URL for shared/cloud persistence.")
-    with st.container(border=True):
-        st.markdown("### New experiment")
+    st.markdown(
+        """
+        <div class="home-brand">
+          <div class="home-brand-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <circle cx="12" cy="13" r="7.2"></circle>
+              <path d="M12 5.8V3.2M9.4 3.2h5.2M17.1 7.8l1.8-1.8"></path>
+              <path d="M12.8 8.6 9.9 13h2.5l-1.2 4.4 3.2-5h-2.5z"></path>
+            </svg>
+          </div>
+          <div>
+            <div class="home-brand-title">Shock Timer</div>
+            <div class="home-brand-subtitle">Create a new experiment or resume a saved session.</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Connected cloud storage is intentionally silent.
+    # Only show an exception state when shared/cloud persistence is unavailable.
+    if DATABASE_KIND != "postgres":
+        with st.container(key="home_cloud_warning"):
+            st.warning(
+                "Cloud storage is unavailable. Local SQLite storage is active; "
+                "sessions will not sync across computers."
+            )
+
+    with st.container(key="home_new_experiment"):
+        st.markdown('<div class="home-section-title">New experiment</div>',unsafe_allow_html=True)
+
         with st.form("new_experiment_form",clear_on_submit=False):
-            cols=st.columns([4.4,1.15,1.7],vertical_alignment="bottom")
-            with cols[0]: experiment_name=st.text_input("Experiment name",placeholder="e.g. Plasma resuscitation 08-22-2026")
-            with cols[1]: subject_count=st.number_input("Mouse subjects",min_value=1,max_value=64,value=INITIAL_MOUSE_COUNT,step=1)
-            with cols[2]: submitted=st.form_submit_button("Configure experiment",use_container_width=True,type="primary")
-        if submitted: begin_experiment_configuration(experiment_name,subject_count)
+            cols=st.columns([4.75,1.20,1.72],vertical_alignment="bottom")
+
+            with cols[0]:
+                experiment_name=st.text_input(
+                    "Experiment name",
+                    placeholder="e.g. Plasma resuscitation 08-22-2026",
+                )
+
+            with cols[1]:
+                subject_count=st.number_input(
+                    "Mouse subjects",
+                    min_value=1,
+                    max_value=64,
+                    value=INITIAL_MOUSE_COUNT,
+                    step=1,
+                )
+
+            with cols[2]:
+                submitted=st.form_submit_button(
+                    "Configure experiment",
+                    use_container_width=True,
+                    type="primary",
+                )
+
+        if submitted:
+            begin_experiment_configuration(experiment_name,subject_count)
+
         error=st.session_state.pop("_home_error",None)
-        if error: st.error(error)
-    experiments=list_experiment_records(); active=[x for x in experiments if x.get("completed_at") is None]; completed=[x for x in experiments if x.get("completed_at") is not None]
-    st.markdown("### Active experiments")
-    if active:
-        for x in active: _render_experiment_card(x,False)
-    else: st.info("No active experiments.")
-    st.markdown("### Completed experiments")
-    if completed:
-        for x in completed: _render_experiment_card(x,True)
-    else: st.caption("Completed experiments will appear here once all subjects are ended.")
-    if st.session_state.get("_pending_weight_warning"): weight_warning_dialog()
-    elif st.session_state.get("_show_configuration_dialog"): configure_experiment_dialog()
+        if error:
+            st.error(error)
+
+    experiments=list_experiment_records()
+    active=[x for x in experiments if x.get("completed_at") is None]
+    completed=[x for x in experiments if x.get("completed_at") is not None]
+
+    with st.container(key="home_active_section"):
+        st.markdown(
+            f'<div class="home-section-title">Active experiments'
+            f'<span class="home-section-count">{len(active)}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+        if active:
+            for exp in active:
+                _render_experiment_card(exp,False)
+        else:
+            st.markdown(
+                '<div class="home-empty-state">No active experiments.</div>',
+                unsafe_allow_html=True,
+            )
+
+    with st.container(key="home_completed_section"):
+        st.markdown(
+            f'<div class="home-section-title">Completed experiments'
+            f'<span class="home-section-count">{len(completed)}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+        if completed:
+            for exp in completed:
+                _render_experiment_card(exp,True)
+        else:
+            st.markdown(
+                '<div class="home-empty-state">Completed experiments will appear here once all subjects are ended.</div>',
+                unsafe_allow_html=True,
+            )
+
+    if st.session_state.get("_pending_weight_warning"):
+        weight_warning_dialog()
+    elif st.session_state.get("_show_configuration_dialog"):
+        configure_experiment_dialog()
 
 def return_to_experiment_home(): retry_unsaved_subjects(); st.session_state.clear(); st.rerun()
 
@@ -878,7 +2996,36 @@ def return_to_experiment_home(): retry_unsaved_subjects(); st.session_state.clea
 
 @st.dialog("Timesheet",width="large")
 def timesheet_dialog(i):
-    st.markdown(f"### {html.escape(subject_name(i))} timesheet",unsafe_allow_html=True); st.caption(f"{weight_label(i)} · {APP_TIMEZONE} · Start events can be back-timed when a button was clicked late."); log=list(st.session_state.get(f"event_log_{i}",[]))
+    st.markdown(f"### {html.escape(subject_name(i))} timesheet",unsafe_allow_html=True)
+
+    start=starting_map(i)
+    end=ending_map(i)
+    bp_left,bp_right=st.columns(2)
+    with bp_left:
+        st.caption("Starting MAP")
+        st.markdown(f"**{'—' if start is None else f'{start:g} mmHg'}**")
+    with bp_right:
+        st.caption("Ending MAP")
+        st.markdown(f"**{'—' if end is None else f'{end:g} mmHg'}**")
+
+    anesthesia_rows=anesthesia_summary_rows(i)
+    if anesthesia_rows:
+        st.markdown("**Anesthesia summary**")
+        ah=st.columns([.55,.85,1.05,1.65,.80],gap="small")
+        for c,label in zip(ah,["Dose","Type","Relative","Absolute time","Weight"]):
+            with c:
+                st.markdown(f'<div class="lab-table-header">{label}</div>',unsafe_allow_html=True)
+        for row_data in anesthesia_rows:
+            ar=st.columns([.55,.85,1.05,1.65,.80],gap="small")
+            with ar[0]: st.caption(str(row_data["dose"]))
+            with ar[1]: st.caption(row_data["type"])
+            with ar[2]: st.caption(row_data["relative"])
+            with ar[3]: st.caption(row_data["absolute"])
+            with ar[4]: st.caption(row_data["weight"])
+
+    st.divider()
+    st.caption(f"{weight_label(i)} · {APP_TIMEZONE} · Start events can be back-timed when a button was clicked late.")
+    log=list(st.session_state.get(f"event_log_{i}",[]))
     if not log: st.info("No events have been recorded.")
     else:
         rel=relative_time_map(i,log); hdr=st.columns([1.85,1.05,1.70,2.35,.85],gap="small")
@@ -894,12 +3041,12 @@ def timesheet_dialog(i):
                 if is_backtime_editable_event(e) and st.button("Back-time",key=f"backtime_select_{i}_{e.get('_id')}",use_container_width=True): st.session_state[f"_backtime_target_{i}"]=e.get("_id")
         target=st.session_state.get(f"_backtime_target_{i}")
         if target:
-            st.divider(); st.markdown("**Back-time selected event**"); mins=st.number_input("Minutes earlier",min_value=.1,step=.5,value=1.0,key=f"backtime_minutes_{i}"); left,right=st.columns(2)
+            st.divider(); st.markdown("**Back-time selected event**"); amount=st.number_input(f"{UNIT_WORD.capitalize()} earlier",min_value=.1,step=.5,value=1.0,key=f"backtime_amount_{i}"); left,right=st.columns(2)
             with left:
                 if st.button("Cancel adjustment",key=f"backtime_cancel_{i}",use_container_width=True): st.session_state.pop(f"_backtime_target_{i}",None); st.rerun()
             with right:
                 if st.button("Apply back-time",key=f"backtime_apply_{i}",use_container_width=True,type="primary"):
-                    ok,error=backtime_start_event(i,target,mins)
+                    ok,error=backtime_start_event(i,target,amount)
                     if ok: st.session_state.pop(f"_backtime_target_{i}",None); st.rerun()
                     st.warning(error)
 
@@ -929,7 +3076,9 @@ def edit_subject_dialog(i):
                 if ok: st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
                 st.warning(error)
 
+@st.cache_data(show_spinner=False)
 def notification_sound_wav(sound_name):
+    """Generate and cache the small WAV used by the Settings sound preview."""
     sample_rate=22050
     notes=[(880.0,0,.18,.32)] if sound_name=="Beep" else ([(760.0,0,.12,.30),(760.0,.20,.12,.30)] if sound_name=="Double beep" else [(660.0,0,.12,.24),(990.0,.11,.22,.25)])
     total_duration=max(s+d for _,s,d,_ in notes)+.04; samples=[0.0]*max(1,int(total_duration*sample_rate)); fade=max(1,int(.012*sample_rate))
@@ -961,8 +3110,8 @@ def settings_dialog():
     first=ordered_subject_indices()[0] if mouse_count() else 1; ik="settings_global_initial_anesthesia"; sk="settings_global_subsequent_anesthesia"; dk="settings_global_anesthesia_delay"; ek="settings_notification_sound_enabled"; nk="settings_notification_sound"
     st.session_state.setdefault(ik,int(st.session_state.get(f"anesthesia_initial_duration_{first}",DEFAULT_INITIAL_ANESTHESIA))); st.session_state.setdefault(sk,int(st.session_state.get(f"anesthesia_duration_{first}",DEFAULT_SUBSEQUENT_ANESTHESIA))); st.session_state.setdefault(dk,int(st.session_state.get(f"anesthesia_delay_duration_{first}",DEFAULT_ANESTHESIA_DELAY))); st.session_state.setdefault(ek,bool(st.session_state.get(f"notification_sound_enabled_{first}",DEFAULT_NOTIFICATION_SOUND_ENABLED))); st.session_state.setdefault(nk,str(st.session_state.get(f"notification_sound_{first}",DEFAULT_NOTIFICATION_SOUND)))
     cols=st.columns(3)
-    with cols[0]: st.number_input(f"First redose ({UNIT_LABEL})",min_value=1,step=1,key=ik,help="Default: 45 minutes after the initial anesthesia dose.")
-    with cols[1]: st.number_input(f"Subsequent redoses ({UNIT_LABEL})",min_value=1,step=1,key=sk,help="Default: every 30 minutes after each redose.")
+    with cols[0]: st.number_input(f"First redose ({UNIT_LABEL})",min_value=1,step=1,key=ik,help=f"Default: 45 {UNIT_WORD} after the initial anesthesia dose.")
+    with cols[1]: st.number_input(f"Subsequent redoses ({UNIT_LABEL})",min_value=1,step=1,key=sk,help=f"Default: every 30 {UNIT_WORD} after each redose.")
     with cols[2]: st.number_input(f"Delay button ({UNIT_LABEL})",min_value=1,step=1,key=dk)
     with st.expander("🔊 Notification sound",expanded=False):
         st.toggle("Play a sound when an event becomes due",key=ek); st.selectbox("Sound",NOTIFICATION_SOUND_OPTIONS,key=nk,disabled=not bool(st.session_state.get(ek,True)),on_change=queue_notification_sound_sample); render_notification_sound_sample(); st.caption("Changing the sound plays a sample immediately.")
@@ -975,6 +3124,47 @@ def settings_dialog():
             _record_global_undo("Update global settings",range(1,mouse_count()+1))
             for i in range(1,mouse_count()+1): st.session_state[f"anesthesia_initial_duration_{i}"]=initial; st.session_state[f"anesthesia_duration_{i}"]=subsequent; st.session_state[f"anesthesia_delay_duration_{i}"]=delay; st.session_state[f"notification_sound_enabled_{i}"]=enabled; st.session_state[f"notification_sound_{i}"]=sound
             persist_subjects(range(1,mouse_count()+1)); st.toast("Global settings updated"); st.rerun()
+
+def _parse_map_value(raw):
+    try: value=float(raw)
+    except (TypeError,ValueError): return None,"Enter a valid MAP in mmHg."
+    if not (1.0 <= value <= 300.0): return None,"MAP must be between 1 and 300 mmHg."
+    return round(value,1),None
+
+@st.dialog("Starting blood pressure")
+def starting_map_dialog(i):
+    st.markdown(f"### {html.escape(subject_name(i))} — starting MAP",unsafe_allow_html=True)
+    st.caption("The shock timer has already started. Record the mean arterial pressure at shock start.")
+    key=f"starting_map_entry_{i}"
+    existing=starting_map(i)
+    st.session_state.setdefault(key,"" if existing is None else f"{existing:g}")
+    st.text_input("MAP (mmHg)",key=key,placeholder="e.g. 85")
+    if st.button("Save starting MAP",key=f"starting_map_save_{i}",use_container_width=True,type="primary"):
+        value,error=_parse_map_value(st.session_state.get(key))
+        if error: st.warning(error)
+        else:
+            st.session_state[f"starting_map_mmhg_{i}"]=value
+            shock_time=st.session_state.get(f"shock_start_{i}") or time.time()
+            log_event(i,"Starting MAP",f"{value:g} mmHg",when_epoch=shock_time)
+            persist_subject(i); st.session_state.pop(key,None); st.toast(f"Starting MAP saved: {value:g} mmHg"); st.rerun()
+
+@st.dialog("Ending blood pressure")
+def ending_map_dialog(i,forced=False):
+    st.markdown(f"### {html.escape(subject_name(i))} — ending MAP",unsafe_allow_html=True)
+    st.caption("Record the final mean arterial pressure in mmHg before ending this subject.")
+    key=f"ending_map_entry_{i}"
+    existing=ending_map(i)
+    st.session_state.setdefault(key,"" if existing is None else f"{existing:g}")
+    st.text_input("MAP (mmHg)",key=key,placeholder="e.g. 75")
+    left,right=st.columns(2)
+    with left:
+        if st.button("Cancel",key=f"ending_map_cancel_{i}",use_container_width=True): st.session_state.pop(key,None); st.rerun()
+    with right:
+        if st.button("Save MAP & end",key=f"ending_map_save_{i}",use_container_width=True,type="primary"):
+            value,error=_parse_map_value(st.session_state.get(key))
+            if error: st.warning(error)
+            else:
+                st.session_state.pop(key,None); end_mouse(i,bool(forced),ending_map_mmhg=value); st.rerun()
 
 @st.dialog("Confirm end")
 def end_confirmation_dialog(i):
@@ -994,17 +3184,36 @@ def reset_confirmation_dialog(i):
 
 @st.dialog("End all subjects")
 def end_all_subjects_dialog():
-    remaining=[i for i in ordered_subject_indices() if not is_ended(i)]; st.markdown("### End all subjects?"); st.write(f"This ends {len(remaining)} remaining subject{'s' if len(remaining)!=1 else ''} and downloads the aggregate timesheet."); left,right=st.columns(2)
+    remaining=[i for i in ordered_subject_indices() if not is_ended(i)]
+    st.markdown("### End all subjects?")
+    st.write(f"This ends {len(remaining)} remaining subject{'s' if len(remaining)!=1 else ''} and downloads the aggregate timesheet.")
+    map_targets=[i for i in remaining if st.session_state.get(f"resus_start_{i}") is not None]
+    if map_targets:
+        st.caption("Enter an ending MAP for each subject that has begun resuscitation.")
+        for i in map_targets:
+            key=f"end_all_map_{i}"; existing=ending_map(i); st.session_state.setdefault(key,"" if existing is None else f"{existing:g}")
+            st.text_input(f"{subject_name(i)} ending MAP (mmHg)",key=key,placeholder="e.g. 75")
+    left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key="end_all_cancel",use_container_width=True): st.rerun()
+        if st.button("Cancel",key="end_all_cancel",use_container_width=True):
+            for i in map_targets: st.session_state.pop(f"end_all_map_{i}",None)
+            st.rerun()
     with right:
         if st.button("End all subjects",key="end_all_confirm",use_container_width=True,type="primary"):
-            if end_all_subjects_current_experiment(): queue_timesheet_auto_download(); st.rerun()
+            ending_maps={}; errors=[]
+            for i in map_targets:
+                value,error=_parse_map_value(st.session_state.get(f"end_all_map_{i}"))
+                if error: errors.append(f"{subject_name(i)}: {error}")
+                else: ending_maps[i]=value
+            if errors: st.warning(" ".join(errors))
+            elif end_all_subjects_current_experiment(ending_maps):
+                for i in map_targets: st.session_state.pop(f"end_all_map_{i}",None)
+                queue_timesheet_auto_download(); st.rerun()
             else: st.error("Subjects were ended locally, but persistent storage has not confirmed the save yet.")
 
 @st.dialog("Add mouse")
 def add_mouse_dialog():
-    new_i=mouse_count()+1; nk,wk="_add_mouse_name","_add_mouse_weight"; st.session_state.setdefault(nk,f"Mouse {new_i}"); st.session_state.setdefault(wk,0.0); st.caption("Enter the mouse name and weight before adding it to the running experiment."); st.text_input("Mouse name",key=nk); st.number_input("Weight (g)",min_value=0.0,max_value=100.0,step=.1,format="%.1f",key=wk); left,right=st.columns(2)
+    new_i=mouse_count()+1; nk,wk="_add_mouse_name","_add_mouse_weight"; st.session_state.setdefault(nk,f"Mouse {new_i}"); st.session_state.setdefault(wk,_default_entry_weight()); st.caption("Enter the mouse name and weight before adding it to the running experiment."); st.text_input("Mouse name",key=nk); st.number_input("Weight (g)",min_value=0.0,max_value=100.0,step=.1,format="%.1f",key=wk); left,right=st.columns(2)
     with left:
         if st.button("Cancel",key="add_mouse_cancel",use_container_width=True): st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
     with right:
@@ -1017,6 +3226,24 @@ def add_mouse_dialog():
                 if ok: st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
                 st.warning(error)
 
+def request_add_mouse_dialog():
+    st.session_state["_pending_dialog"]={"mouse":0,"kind":"add_mouse"}
+    st.session_state["_needs_full_rerun"]=True
+
+def request_dialog(i,kind,**extra):
+    st.session_state["_pending_dialog"]={"mouse":int(i),"kind":kind,**extra}
+    st.session_state["_needs_full_rerun"]=True
+def request_end_dialog(i,forced=False):
+    if st.session_state.get(f"resus_start_{i}") is not None: request_dialog(i,"ending_map",forced=bool(forced))
+    else: request_dialog(i,"end")
+def _rerun_entire_app():
+    """Force an app-level rerun even when invoked from inside a Streamlit fragment."""
+    try:
+        st.rerun(scope="app")
+    except TypeError:
+        # Compatibility fallback for Streamlit versions without the scope kwarg.
+        st.rerun()
+
 def request_add_mouse_dialog(): st.session_state["_pending_dialog"]={"mouse":0,"kind":"add_mouse"}
 def request_dialog(i,kind): st.session_state["_pending_dialog"]={"mouse":int(i),"kind":kind}
 def render_pending_dialog():
@@ -1026,6 +3253,8 @@ def render_pending_dialog():
     if kind=="add_mouse": add_mouse_dialog(); return
     i=int(req.get("mouse",0))
     if not 1<=i<=mouse_count(): return
+    if kind=="starting_map": starting_map_dialog(i); return
+    if kind=="ending_map": ending_map_dialog(i,bool(req.get("forced",False))); return
     {"timesheet":timesheet_dialog,"comment":comment_dialog,"edit":edit_subject_dialog,"end":end_confirmation_dialog,"reset":reset_confirmation_dialog}.get(kind,lambda _:None)(i)
 
 # ============================================================
@@ -1054,24 +3283,107 @@ def action_targets_for_alert(i,event,remaining):
     return []
 
 def collect_attention_items(wall_now):
-    sticky=st.session_state.setdefault("_sticky_alerts",{}); active=set()
+    """Return sticky warning/overdue alerts for the current timer frame."""
+    sticky = st.session_state.setdefault("_sticky_alerts", {})
+    active_keys = set()
+
     for i in ordered_subject_indices():
-        if is_ended(i): clear_mouse_alerts(i); continue
-        now=effective_now(i,wall_now)
-        for event,remaining in get_upcoming_events(i,now):
-            key=alert_key(i,event); active.add(key); level=urgency_for_remaining(remaining)
-            if level in ("orange","red"): sticky[key]={"mouse":i,"name":subject_name(i),"event":event,"remaining":remaining,"level":level}
-    for key in list(sticky):
-        if key not in active: sticky.pop(key,None)
-    items=[]
-    for x in sticky.values():
-        y=dict(x); y["targets"]=action_targets_for_alert(y["mouse"],y["event"],y["remaining"]); items.append(y)
-    return sorted(items,key=lambda x:(0 if x["level"]=="red" else 1,x["remaining"]))
+        if is_ended(i):
+            clear_mouse_alerts(i)
+            continue
+
+        now = effective_now(i, wall_now)
+        for event, remaining in get_upcoming_events(i, now):
+            key = alert_key(i, event)
+            active_keys.add(key)
+            level = urgency_for_remaining(remaining)
+
+            # Sticky alerts appear once they enter warning or overdue state and
+            # remain present until the underlying task is resolved.
+            if level in ("orange", "red"):
+                sticky[key] = {
+                    "mouse": i,
+                    "name": subject_name(i),
+                    "event": event,
+                    "remaining": remaining,
+                    "level": level,
+                }
+
+    # Drop alerts whose underlying task no longer exists.
+    for key in tuple(sticky):
+        if key not in active_keys:
+            sticky.pop(key, None)
+
+    items = []
+    for alert in sticky.values():
+        item = dict(alert)
+        item["targets"] = action_targets_for_alert(
+            item["mouse"], item["event"], item["remaining"]
+        )
+        items.append(item)
+
+    # Overdue items sort before upcoming warnings, then by time remaining.
+    return sorted(
+        items,
+        key=lambda item: (
+            0 if item["level"] == "red" else 1,
+            item["remaining"],
+        ),
+    )
+
 
 def render_attention_snapshot(items):
-    first=ordered_subject_indices()[0] if mouse_count() else 1; payload={"items":[{"mouse":x["mouse"],"name":x["name"],"event":x["event"],"level":x["level"],"targets":x.get("targets",[])} for x in items],"soundEnabled":bool(st.session_state.get(f"notification_sound_enabled_{first}",DEFAULT_NOTIFICATION_SOUND_ENABLED)),"soundName":str(st.session_state.get(f"notification_sound_{first}",DEFAULT_NOTIFICATION_SOUND))}; encoded=base64.b64encode(json.dumps(payload,separators=(",",":")).encode()).decode(); st.html(f'<div data-lab-attention-snapshot="{encoded}" style="display:none!important"></div>')
+    payload_items=[]
+    for x in items:
+        mouse=int(x["mouse"])
+        payload_items.append({
+            "mouse":mouse,
+            "name":x["name"],
+            "event":x["event"],
+            "level":x["level"],
+            "remaining":float(x.get("remaining",0.0)),
+            "targets":x.get("targets",[]),
+            "soundEnabled":bool(
+                st.session_state.get(
+                    f"notification_sound_enabled_{mouse}",
+                    DEFAULT_NOTIFICATION_SOUND_ENABLED,
+                )
+            ),
+            "soundName":str(
+                st.session_state.get(
+                    f"notification_sound_{mouse}",
+                    DEFAULT_NOTIFICATION_SOUND,
+                )
+            ),
+        })
 
-def queue_timesheet_auto_download(): st.session_state["_pending_auto_download"]={"token":uuid.uuid4().hex,"filename":f"shock_timer_timesheets_{wall_datetime().strftime('%Y-%m-%d')}.txt","content_b64":base64.b64encode(build_all_timesheets_text().encode()).decode()}
+    payload={"items":payload_items}
+    encoded=base64.b64encode(
+        json.dumps(payload,separators=(",",":")).encode()
+    ).decode()
+    st.html(
+        f'<div data-lab-attention-snapshot="{encoded}" '
+        f'style="display:none!important"></div>'
+    )
+
+
+def _safe_export_filename_part(value):
+    text=str(value or "experiment").strip()
+    text=re.sub(r"[^A-Za-z0-9._-]+","_",text)
+    text=re.sub(r"_+","_",text).strip("._-")
+    return text or "experiment"
+
+def timesheet_export_filename():
+    experiment=_safe_export_filename_part(st.session_state.get("_active_experiment_name","experiment"))
+    stamp=wall_datetime().strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{experiment}_{stamp}_timesheets.txt"
+
+def queue_timesheet_auto_download():
+    st.session_state["_pending_auto_download"]={
+        "token":uuid.uuid4().hex,
+        "filename":timesheet_export_filename(),
+        "content_b64":base64.b64encode(build_all_timesheets_text().encode()).decode(),
+    }
 def render_pending_auto_download_marker():
     pending=st.session_state.get("_pending_auto_download")
     if pending: st.html(f'<div data-lab-auto-download-token="{html.escape(pending["token"],quote=True)}" data-lab-auto-download-filename="{html.escape(pending["filename"],quote=True)}" data-lab-auto-download-content="{pending["content_b64"]}" style="display:none!important"></div>')
@@ -1080,27 +3392,324 @@ def install_browser_helpers():
     components.html(r"""
     <script>
     (()=>{
-      const doc=window.parent.document,BAR='lab-attention-v40',P='lab-next-primary-v40',D='lab-next-delay-v40';
-      let bar=doc.getElementById(BAR);if(!bar){bar=doc.createElement('div');bar.id=BAR;bar.style.cssText='display:none;position:fixed;z-index:999999';doc.body.appendChild(bar)}
-      if(!doc.getElementById('lab-v40-browser-style')){const s=doc.createElement('style');s.id='lab-v40-browser-style';s.textContent=`.${P} button{outline:2px solid rgba(245,161,38,.55)!important;outline-offset:1px}.${D} button{outline:2px solid rgba(184,122,244,.5)!important;outline-offset:1px}`;doc.head.appendChild(s)}
-      let last='',dismissed='',targets=[],lastDue='';
-      function beep(name){try{const C=window.AudioContext||window.webkitAudioContext,c=new C();const note=(f,t,d)=>{const o=c.createOscillator(),g=c.createGain();o.frequency.value=f;g.gain.setValueAtTime(.0001,c.currentTime+t);g.gain.exponentialRampToValueAtTime(.12,c.currentTime+t+.01);g.gain.exponentialRampToValueAtTime(.0001,c.currentTime+t+d);o.connect(g);g.connect(c.destination);o.start(c.currentTime+t);o.stop(c.currentTime+t+d+.02)};if(name==='Double beep'){note(760,0,.12);note(760,.2,.12)}else if(name==='Beep')note(880,0,.18);else{note(660,0,.14);note(990,.11,.22)}}catch(_){}}
-      function apply(encoded){let p;try{p=JSON.parse(atob(encoded))}catch(e){return}const items=p.items||[];if(encoded!==last)dismissed='';last=encoded;targets=[];for(const item of items)for(const t of(item.targets||[]))if(!targets.some(x=>x.key===t.key&&x.style===t.style))targets.push(t);const due=items.filter(x=>x.level==='red').map(x=>x.mouse+':'+x.event).sort().join('|');if(due&&due!==lastDue&&p.soundEnabled)beep(p.soundName||'Chime');lastDue=due;if(!items.length||dismissed===encoded)bar.style.display='none';else{bar.innerHTML=items.map(i=>`<span class="${i.level}" style="margin-right:14px">${i.name}: ${i.event}</span>`).join('')+`<span class="x">×</span>`;bar.querySelector('.x').onclick=()=>{dismissed=encoded;bar.style.display='none'};bar.style.display='block'}}
-      function highlights(){const wanted=new Map(targets.map(t=>[t.key,t.style==='delay'?D:P]));doc.querySelectorAll(`.${P},.${D}`).forEach(n=>{const kc=[...n.classList].find(c=>c.startsWith('st-key-'));const k=kc?kc.slice(7):null,w=k?wanted.get(k):null;if(!w||!n.classList.contains(w))n.classList.remove(P,D)});for(const[k,c]of wanted.entries())doc.querySelectorAll(`.st-key-${k}`).forEach(n=>{const b=n.querySelector('button');if(b&&!b.disabled){n.classList.remove(P,D);n.classList.add(c)}})}
-      function full(){const w=doc.querySelector('.st-key-fullscreen_view');if(!w||w.dataset.bound==='1')return;const b=w.querySelector('button');if(!b)return;w.dataset.bound='1';b.addEventListener('click',()=>{const r=doc.documentElement;if(!doc.fullscreenElement&&r.requestFullscreen)r.requestFullscreen().catch(()=>{});else if(doc.fullscreenElement&&doc.exitFullscreen)doc.exitFullscreen().catch(()=>{})},true)}
-      function download(){const ms=doc.querySelectorAll('[data-lab-auto-download-token]');if(!ms.length)return;const m=ms[ms.length-1],t=m.dataset.labAutoDownloadToken,e=m.dataset.labAutoDownloadContent;if(!t||!e||doc.documentElement.dataset.labLastDownload===t)return;try{const bin=atob(e),bytes=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);const url=URL.createObjectURL(new Blob([bytes],{type:'text/plain;charset=utf-8'}));const a=doc.createElement('a');a.href=url;a.download=m.dataset.labAutoDownloadFilename||'shock_timer_timesheets.txt';doc.body.appendChild(a);doc.documentElement.dataset.labLastDownload=t;a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1500)}catch(_){}}
-      function poll(){const ss=doc.querySelectorAll('[data-lab-attention-snapshot]');if(ss.length){const e=ss[ss.length-1].dataset.labAttentionSnapshot;if(e&&e!==last)apply(e)}highlights();full();download()}
-      poll();setInterval(poll,150);
+      const root=window.parent;
+      const doc=root.document;
+      const BAR='lab-attention-v40',P='lab-next-primary-v40',D='lab-next-delay-v40';
+
+      let bar=doc.getElementById(BAR);
+      if(!bar){
+        bar=doc.createElement('div');
+        bar.id=BAR;
+        bar.style.cssText='display:none;position:fixed;z-index:999999';
+        doc.body.appendChild(bar);
+      }
+
+      if(!doc.getElementById('lab-v40-browser-style')){
+        const s=doc.createElement('style');
+        s.id='lab-v40-browser-style';
+        s.textContent=`.${P} button{outline:2px solid rgba(245,161,38,.55)!important;outline-offset:1px}.${D} button{outline:2px solid rgba(184,122,244,.5)!important;outline-offset:1px}`;
+        doc.head.appendChild(s);
+      }
+
+      /*
+        Persist audio state on the parent window. This survives Streamlit
+        component remounts and prevents the notification from being delayed
+        until some later click.
+      */
+      const A=root.__shockTimerAudioState||(root.__shockTimerAudioState={
+        ctx:null,
+        unlocked:false,
+        bound:false,
+        timers:{},
+        dueAt:{},
+        sounded:new Set(),
+        active:new Set()
+      });
+
+      function getAudioContext(){
+        try{
+          if(!A.ctx){
+            const C=root.AudioContext||root.webkitAudioContext;
+            if(C) A.ctx=new C();
+          }
+          return A.ctx;
+        }catch(_){
+          return null;
+        }
+      }
+
+      function primeAudio(c){
+        try{
+          const o=c.createOscillator();
+          const g=c.createGain();
+          g.gain.setValueAtTime(.00001,c.currentTime);
+          o.frequency.value=40;
+          o.connect(g);
+          g.connect(c.destination);
+          o.start();
+          o.stop(c.currentTime+.025);
+          A.unlocked=true;
+        }catch(_){}
+      }
+
+      function unlockAudio(){
+        const c=getAudioContext();
+        if(!c) return;
+        if(c.state==='suspended'){
+          c.resume().then(()=>primeAudio(c)).catch(()=>{});
+        }else{
+          primeAudio(c);
+        }
+      }
+
+      if(!A.bound){
+        ['pointerdown','mousedown','touchstart','keydown'].forEach(ev=>{
+          doc.addEventListener(ev,unlockAudio,{capture:true,passive:true});
+        });
+        A.bound=true;
+      }
+
+      function beep(name){
+        try{
+          const c=getAudioContext();
+
+          /*
+            Do not queue a blocked sound. If audio was not unlocked when the
+            timer became due, mark the due event as handled rather than playing
+            it late on a later button click.
+          */
+          if(!c||!A.unlocked||c.state!=='running') return false;
+
+          const note=(f,t,d)=>{
+            const o=c.createOscillator();
+            const g=c.createGain();
+            o.frequency.value=f;
+            g.gain.setValueAtTime(.0001,c.currentTime+t);
+            g.gain.exponentialRampToValueAtTime(.14,c.currentTime+t+.01);
+            g.gain.exponentialRampToValueAtTime(.0001,c.currentTime+t+d);
+            o.connect(g);
+            g.connect(c.destination);
+            o.start(c.currentTime+t);
+            o.stop(c.currentTime+t+d+.02);
+          };
+
+          if(name==='Double beep'){
+            note(760,0,.12);
+            note(760,.20,.12);
+          }else if(name==='Beep'){
+            note(880,0,.18);
+          }else{
+            note(660,0,.14);
+            note(990,.11,.22);
+          }
+          return true;
+        }catch(_){
+          return false;
+        }
+      }
+
+      function alertKey(item){
+        return String(item.mouse)+':'+String(item.event);
+      }
+
+      function cancelTimer(key){
+        if(A.timers[key]){
+          clearTimeout(A.timers[key]);
+          delete A.timers[key];
+        }
+        delete A.dueAt[key];
+      }
+
+      function scheduleDue(item){
+        const key=alertKey(item);
+        const remaining=Number(item.remaining);
+        if(!Number.isFinite(remaining)||remaining<=0) return;
+
+        const dueAt=Date.now()+(remaining*1000);
+        const prior=A.dueAt[key];
+
+        // A meaningful due-time change means pause/delay/back-timing changed.
+        if(prior&&Math.abs(prior-dueAt)<350) return;
+
+        cancelTimer(key);
+        A.dueAt[key]=dueAt;
+
+        A.timers[key]=setTimeout(()=>{
+          delete A.timers[key];
+          delete A.dueAt[key];
+
+          // The task may have been resolved before the scheduled boundary.
+          if(!A.active.has(key)) return;
+
+          if(!A.sounded.has(key)){
+            if(item.soundEnabled) beep(item.soundName||'Chime');
+            A.sounded.add(key);
+          }
+        },Math.max(0,dueAt-Date.now()));
+      }
+
+      let last='',dismissed='',targets=[];
+
+      function apply(encoded){
+        let p;
+        try{
+          p=JSON.parse(atob(encoded));
+        }catch(_){
+          return;
+        }
+
+        const items=p.items||[];
+
+        if(encoded!==last) dismissed='';
+        last=encoded;
+
+        targets=[];
+        for(const item of items){
+          for(const t of(item.targets||[])){
+            if(!targets.some(x=>x.key===t.key&&x.style===t.style)){
+              targets.push(t);
+            }
+          }
+        }
+
+        const nextActive=new Set(items.map(alertKey));
+
+        // Remove timers/state for alerts that have been resolved.
+        for(const key of Object.keys(A.timers)){
+          if(!nextActive.has(key)) cancelTimer(key);
+        }
+        for(const key of [...A.sounded]){
+          if(!nextActive.has(key)) A.sounded.delete(key);
+        }
+        A.active=nextActive;
+
+        for(const item of items){
+          const key=alertKey(item);
+          const remaining=Number(item.remaining);
+
+          if(item.level==='red'||remaining<=0){
+            cancelTimer(key);
+            if(!A.sounded.has(key)){
+              if(item.soundEnabled) beep(item.soundName||'Chime');
+              // Mark handled even if browser audio was not yet unlocked:
+              // never play this notification late.
+              A.sounded.add(key);
+            }
+          }else{
+            // A recurring event (e.g. anesthesia redose) has been reset.
+            if(remaining>0&&A.sounded.has(key)) A.sounded.delete(key);
+
+            // Schedule directly from remaining time so sound is tied to the
+            // actual due boundary rather than a later Streamlit rerender.
+            if(item.level==='orange'&&remaining>0){
+              scheduleDue(item);
+            }else{
+              cancelTimer(key);
+            }
+          }
+        }
+
+        if(!items.length||dismissed===encoded){
+          bar.style.display='none';
+        }else{
+          bar.innerHTML=items.map(
+            i=>`<span class="${i.level}" style="margin-right:14px">${i.name}: ${i.event}</span>`
+          ).join('')+`<span class="x">×</span>`;
+          bar.querySelector('.x').onclick=()=>{
+            dismissed=encoded;
+            bar.style.display='none';
+          };
+          bar.style.display='block';
+        }
+      }
+
+      function highlights(){
+        const wanted=new Map(targets.map(t=>[t.key,t.style==='delay'?D:P]));
+
+        doc.querySelectorAll(`.${P},.${D}`).forEach(n=>{
+          const kc=[...n.classList].find(c=>c.startsWith('st-key-'));
+          const k=kc?kc.slice(7):null;
+          const w=k?wanted.get(k):null;
+          if(!w||!n.classList.contains(w)) n.classList.remove(P,D);
+        });
+
+        for(const[k,c]of wanted.entries()){
+          doc.querySelectorAll(`.st-key-${k}`).forEach(n=>{
+            const b=n.querySelector('button');
+            if(b&&!b.disabled){
+              n.classList.remove(P,D);
+              n.classList.add(c);
+            }
+          });
+        }
+      }
+
+      function full(){
+        const w=doc.querySelector('.st-key-fullscreen_view');
+        if(!w||w.dataset.bound==='1') return;
+        const b=w.querySelector('button');
+        if(!b) return;
+
+        w.dataset.bound='1';
+        b.addEventListener('click',()=>{
+          const r=doc.documentElement;
+          if(!doc.fullscreenElement&&r.requestFullscreen){
+            r.requestFullscreen().catch(()=>{});
+          }else if(doc.fullscreenElement&&doc.exitFullscreen){
+            doc.exitFullscreen().catch(()=>{});
+          }
+        },true);
+      }
+
+      function download(){
+        const ms=doc.querySelectorAll('[data-lab-auto-download-token]');
+        if(!ms.length) return;
+
+        const m=ms[ms.length-1];
+        const t=m.dataset.labAutoDownloadToken;
+        const e=m.dataset.labAutoDownloadContent;
+
+        if(!t||!e||doc.documentElement.dataset.labLastDownload===t) return;
+
+        try{
+          const bin=atob(e);
+          const bytes=new Uint8Array(bin.length);
+          for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+
+          const url=URL.createObjectURL(
+            new Blob([bytes],{type:'text/plain;charset=utf-8'})
+          );
+          const a=doc.createElement('a');
+          a.href=url;
+          a.download=m.dataset.labAutoDownloadFilename||'shock_timer_timesheets.txt';
+          doc.body.appendChild(a);
+          doc.documentElement.dataset.labLastDownload=t;
+          a.click();
+          a.remove();
+          setTimeout(()=>URL.revokeObjectURL(url),1500);
+        }catch(_){}
+      }
+
+      function poll(){
+        const ss=doc.querySelectorAll('[data-lab-attention-snapshot]');
+        if(ss.length){
+          const e=ss[ss.length-1].dataset.labAttentionSnapshot;
+          if(e&&e!==last) apply(e);
+        }
+        highlights();
+        full();
+        download();
+      }
+
+      poll();
+      setInterval(poll,100);
     })();
     </script>
     """,width=1,height=1,tab_index=-1)
-
 # ============================================================
 # DISPLAY / WORKFLOW
 # ============================================================
 
-def html_cell(primary,secondary=None,tone="normal"):
-    cls="lab-primary-text"+(f" {tone}" if tone!="normal" else ""); second=f'<div class="lab-secondary-text">{html.escape(str(secondary))}</div>' if secondary else ""; return f'<div class="lab-cell"><div class="{cls}">{html.escape(str(primary))}</div>{second}</div>'
 
 def mouse_status_tone(i,now):
     if is_paused(i) or is_ended(i) or st.session_state.get(f"experiment_start_{i}") is None: return "gray"
@@ -1125,11 +3734,34 @@ def anesthesia_display(i,now):
     remaining=anesthesia_remaining(i,now); tone=urgency_for_remaining(remaining); label="First redose" if anesthesia_dose_count(i)<=1 else "Redose"; return (f"{label} due",weight_label(i),tone) if remaining<=0 else (f"{label} in {format_timer(remaining)}",weight_label(i),tone if tone!="normal" else "normal")
 
 def render_anesthesia_controls(i):
-    delay=st.session_state[f"anesthesia_delay_duration_{i}"]; redose=st.session_state.get(f"anesthesia_initial_duration_{i}",DEFAULT_INITIAL_ANESTHESIA) if anesthesia_dose_count(i)<=1 else st.session_state.get(f"anesthesia_duration_{i}",DEFAULT_SUBSEQUENT_ANESTHESIA); disabled=st.session_state.get(f"experiment_start_{i}") is None or st.session_state.get(f"anesthesia_start_{i}") is None or is_paused(i) or is_ended(i); cols=st.columns(2,gap="small")
-    with cols[0]:
-        with st.container(key=f"anesthesia_redose_action_{i}"): st.button(f"Redose ({redose}{UNIT_SHORT})",key=f"redose_{i}",use_container_width=True,disabled=disabled,on_click=start_or_redose_anesthesia,args=(i,),help="Record the anesthesia redose now.")
-    with cols[1]:
-        with st.container(key=f"anesthesia_delay_action_{i}"): st.button(f"Delay ({delay}{UNIT_SHORT})",key=f"delay_{i}",use_container_width=True,disabled=disabled,on_click=delay_anesthesia_reminder,args=(i,),help="Delay the reminder from this moment.")
+    delay=st.session_state[f"anesthesia_delay_duration_{i}"]
+    redose=st.session_state.get(f"anesthesia_initial_duration_{i}",DEFAULT_INITIAL_ANESTHESIA) if anesthesia_dose_count(i)<=1 else st.session_state.get(f"anesthesia_duration_{i}",DEFAULT_SUBSEQUENT_ANESTHESIA)
+    disabled=st.session_state.get(f"experiment_start_{i}") is None or st.session_state.get(f"anesthesia_start_{i}") is None or is_paused(i) or is_ended(i)
+
+    with st.container(key=f"anesthesia_controls_{i}"):
+        cols=st.columns(2,gap="small")
+        with cols[0]:
+            with st.container(key=f"anesthesia_redose_action_{i}"):
+                st.button(
+                    f"Redose ({redose}{UNIT_SHORT})",
+                    key=f"redose_{i}",
+                    use_container_width=True,
+                    disabled=disabled,
+                    on_click=start_or_redose_anesthesia,
+                    args=(i,),
+                    help="Record the anesthesia redose now.",
+                )
+        with cols[1]:
+            with st.container(key=f"anesthesia_delay_action_{i}"):
+                st.button(
+                    f"Delay ({delay}{UNIT_SHORT})",
+                    key=f"delay_{i}",
+                    use_container_width=True,
+                    disabled=disabled,
+                    on_click=delay_anesthesia_reminder,
+                    args=(i,),
+                    help="Delay the reminder from this moment.",
+                )
 
 def workflow_statuses(i,now):
     anes,board,shock,resus=st.session_state.get(f"anesthesia_start_{i}"),st.session_state.get(f"board_start_{i}"),st.session_state.get(f"shock_start_{i}"),st.session_state.get(f"resus_start_{i}"); states=["pending"]*4
@@ -1189,7 +3821,7 @@ def render_primary_action(i,now):
         wrapper=f"primary_start_anesthesia_wrapper_{i}" if action=="start_anesthesia" else f"primary_action_{i}"
         with st.container(key=wrapper): st.button(label,key=f"primary_{action}_{i}",use_container_width=True,on_click=fn,args=(i,)); return
     if action=="end":
-        with st.container(key=f"primary_action_{i}"): st.button("■ End",key=f"primary_end_{i}",use_container_width=True,on_click=request_dialog,args=(i,"end")); return
+        with st.container(key=f"primary_action_{i}"): st.button("■ End",key=f"primary_end_{i}",use_container_width=True,on_click=request_end_dialog,args=(i,False)); return
     with st.container(key=f"primary_pause_{i}"): st.button("Ⅱ Pause",key=f"primary_pause_button_{i}",use_container_width=True,on_click=toggle_pause,args=(i,))
 
 def force_advance_label(i,now):
@@ -1204,7 +3836,7 @@ def force_advance(i):
     now=time.time(); label=force_advance_label(i,now)
     if label=="⏭ Force start shock": start_shock(i,True)
     elif label=="⏭ Force start resus": start_resuscitation(i,True)
-    elif label=="⏭ Force end subject": end_mouse(i,True)
+    elif label=="⏭ Force end subject": request_end_dialog(i,True)
 
 def _process_menu(i,selection):
     if not selection: return
@@ -1217,7 +3849,7 @@ def _process_menu(i,selection):
     elif selection.startswith("↶ Undo"): undo_last_stage_action(i); st.rerun()
     elif selection.startswith("⏭ Force"): force_advance(i); st.rerun()
     elif selection=="↻ Reset subject": request_dialog(i,"reset"); st.rerun()
-    elif selection=="■ End subject": request_dialog(i,"end"); st.rerun()
+    elif selection=="■ End subject": request_end_dialog(i,False); st.rerun()
 
 def render_overflow_control(i,now):
     options=["View timesheet","Add comment","Edit subject"]; group=_reorder_group(i,time.time()); peers=[j for j in ordered_subject_indices() if _reorder_group(j,time.time())==group]
@@ -1249,36 +3881,147 @@ def _v40_mouse_icon():
             '<path d="M18.9 9.7c.1-2.3 2.1-4.3 4.4-4.2 2.4.1 3.8 2.4 3.1 4.4"/><circle cx="21.2" cy="15.3" r=".8"/><path d="M8.6 21.7c-3.2.2-5.5 1.5-6.4 3.7"/></svg></span>')
 
 def _v40_next_event_html(text,tone):
-    safe=html.escape(str(text)); tc="" if tone=="normal" else f" {tone}"
-    if " in " in str(text):
-        prefix,metric=str(text).rsplit(" ",1); return f'<div class="lab-cell"><div class="lab-mini-label">Next event</div><div class="lab-next-caption">{html.escape(prefix)}</div><div class="lab-next-time{tc}">{html.escape(metric)}</div></div>'
-    cls=f"lab-primary-text {tone}" if tone!="normal" else "lab-primary-text"; return f'<div class="lab-cell"><div class="lab-mini-label">Next event</div><div class="{cls}">{safe}</div></div>'
+    raw=str(text)
+    tone_class="" if tone=="normal" else f" {tone}"
 
-def render_mouse_row(i,wall_now,finished=False):
-    now=effective_now(i,wall_now); exp_start=st.session_state.get(f"experiment_start_{i}"); total=elapsed_from(exp_start,now) if exp_start is not None else 0.0
+    if " in " in raw:
+        prefix,metric=raw.rsplit(" ",1)
+        if prefix=="Anesthesia in":
+            prefix="Anes. in"
+        return (
+            '<div class="lab-cell lab-next-event-cell">'
+            '<div class="lab-mini-label">Next event</div>'
+            '<div class="lab-next-inline">'
+            f'<span class="lab-next-copy">{html.escape(prefix)}</span>'
+            f'<span class="lab-next-metric{tone_class}">{html.escape(metric)}</span>'
+            '</div>'
+            '</div>'
+        )
+
+    # Keep all non-countdown states on the exact same second row.
+    display=raw.replace("Anesthesia","Anes.")
+    primary_class=f"lab-next-inline lab-primary-text {tone}" if tone!="normal" else "lab-next-inline lab-primary-text"
+    return (
+        '<div class="lab-cell lab-next-event-cell">'
+        '<div class="lab-mini-label">Next event</div>'
+        f'<div class="{primary_class}">{html.escape(display)}</div>'
+        '</div>'
+    )
+
+def render_mouse_row(i, wall_now, finished=False):
+    """Render one subject row. Timer calculations use a single effective timestamp."""
+    now = effective_now(i, wall_now)
+    experiment_start = st.session_state.get(f"experiment_start_{i}")
+    total = elapsed_from(experiment_start, now) if experiment_start is not None else 0.0
+
     with st.container(key=f"mouse_row_{i}"):
-        st.markdown(f'<span class="v40-row-state" data-v40-finished="{"true" if finished else "false"}"></span>',unsafe_allow_html=True); cols=st.columns([1.42,1.18,.78,3.32,1.92,1.62],gap="small",vertical_alignment="center")
+        st.markdown(
+            f'<span class="v40-row-state" '
+            f'data-v40-finished="{"true" if finished else "false"}"></span>',
+            unsafe_allow_html=True,
+        )
+        cols = st.columns(
+            RUNNING_ROW_COLUMNS,
+            gap="small",
+            vertical_alignment="center",
+        )
+
+        # Subject identity. The hidden MAP placeholder preserves layout before
+        # the starting pressure is recorded.
         with cols[0]:
-            tone=mouse_status_tone(i,now); paused=""
+            tone = mouse_status_tone(i, now)
+            paused_html = ""
             if is_paused(i):
-                ps=st.session_state.get(f"pause_started_{i}"); paused=f'<div class="lab-paused-label">Paused {format_timer(elapsed_from(ps,wall_now) if ps else 0)}</div>'
-            st.markdown(f'<div class="lab-mouse-wrap"><span class="lab-dot {tone}"></span><div class="lab-mouse-identity">{_v40_mouse_icon()}<div style="min-width:0">{paused}<div class="lab-mouse-name">{html.escape(subject_name(i))}</div></div></div></div>',unsafe_allow_html=True)
+                pause_started = st.session_state.get(f"pause_started_{i}")
+                paused_html = (
+                    f'<div class="lab-paused-label">'
+                    f'Paused {format_timer(elapsed_from(pause_started, wall_now) if pause_started else 0)}'
+                    f'</div>'
+                )
+
+            map_value = starting_map(i)
+            starting_map_html = (
+                f'<div class="lab-starting-map">Starting MAP {map_value:g} mmHg</div>'
+                if map_value is not None
+                else (
+                    '<div class="lab-starting-map lab-starting-map-placeholder">'
+                    'Starting MAP 000 mmHg</div>'
+                )
+            )
+
+            st.markdown(
+                f'<div class="lab-mouse-wrap">'
+                f'<span class="lab-dot {tone}"></span>'
+                f'<div class="lab-mouse-identity">'
+                f'{_v40_mouse_icon()}'
+                f'<div class="lab-subject-copy">'
+                f'{paused_html}'
+                f'<div class="lab-mouse-name">{html.escape(subject_name(i))}</div>'
+                f'{starting_map_html}'
+                f'</div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
         with cols[1]:
-            text,tone=get_next_event_display(i,now); st.markdown(_v40_next_event_html(text,tone),unsafe_allow_html=True)
-        with cols[2]: st.markdown(f'<div class="lab-cell"><div class="lab-mini-label">Total</div><div class="lab-total">{format_total_elapsed(total)}</div></div>',unsafe_allow_html=True)
-        with cols[3]: st.markdown(workflow_html(i,now),unsafe_allow_html=True)
+            next_text, next_tone = get_next_event_display(i, now)
+            st.markdown(
+                _v40_next_event_html(next_text, next_tone),
+                unsafe_allow_html=True,
+            )
+
+        with cols[2]:
+            st.markdown(
+                f'<div class="lab-cell lab-total-cell">'
+                f'<div class="lab-mini-label">Total</div>'
+                f'<div class="lab-total">{format_total_elapsed(total)}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        with cols[3]:
+            st.markdown(workflow_html(i, now), unsafe_allow_html=True)
+
         with cols[4]:
-            p,s,t=anesthesia_display(i,now); st.markdown('<div class="lab-mini-label" style="margin-top:.06rem;">Anesthesia</div>',unsafe_allow_html=True); st.markdown(html_cell(p,s,t),unsafe_allow_html=True); render_anesthesia_controls(i)
-        with cols[5]:
-            actions=st.columns([1,.28],gap="small")
-            with actions[0]: render_primary_action(i,now)
-            with actions[1]: render_overflow_control(i,now)
+            anesthesia_text, weight_text, anesthesia_tone = anesthesia_display(i, now)
+            tone_class = "" if anesthesia_tone == "normal" else f" {anesthesia_tone}"
+            st.markdown(
+                f'<div class="lab-anesthesia-copy '
+                f'anesthesia-tone-{html.escape(str(anesthesia_tone))}">'
+                f'<div class="lab-mini-label">Anesthesia</div>'
+                f'<div class="lab-anesthesia-status-row">'
+                f'<div class="lab-primary-text{tone_class}">'
+                f'{html.escape(str(anesthesia_text))}</div>'
+                f'<div class="lab-anesthesia-weight-inline">'
+                f'{html.escape(str(weight_text))}</div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            render_anesthesia_controls(i)
+
+        # cols[5] is deliberately empty to separate anesthesia from Actions.
+        with cols[6]:
+            actions = st.columns(RUNNING_ACTION_COLUMNS, gap="small")
+            with actions[0]:
+                render_primary_action(i, now)
+            with actions[1]:
+                render_overflow_control(i, now)
+
 
 @st.fragment(run_every=REFRESH_INTERVAL)
 def show_timers():
-    if st.session_state.get("_pending_dialog"): st.rerun()
-    if st.session_state.pop("_needs_full_rerun",False): st.rerun()
-    wall_now=time.time(); render_attention_snapshot(collect_attention_items(wall_now)); active=[]; completed=[]
+    if st.session_state.get("_pending_dialog"):
+        st.session_state["_needs_full_rerun"]=False
+        _rerun_entire_app()
+    if st.session_state.pop("_needs_full_rerun",False):
+        _rerun_entire_app()
+    wall_now=time.time()
+    attention_items=collect_attention_items(wall_now)
+    render_attention_snapshot(attention_items)
+    active=[]
+    completed=[]
     for i in ordered_subject_indices(): (completed if mouse_is_complete(i,effective_now(i,wall_now)) else active).append(i)
     for i in active: render_mouse_row(i,wall_now,False)
     with st.container(key="add_mouse_card"): st.button("⊕  + Add mouse",key="add_mouse_subject",use_container_width=True,on_click=request_add_mouse_dialog)
@@ -1300,16 +4043,25 @@ if st.session_state.get("_pending_weight_warning"): weight_warning_dialog()
 else: render_pending_dialog()
 render_pending_auto_download_marker(); install_browser_helpers()
 
-header=st.columns([1.02,4.10,.90,.88,1.42,1.22,.88],vertical_alignment="center")
+header = st.columns(HEADER_COLUMNS, vertical_alignment="center")
 with header[0]:
     if st.button("← Experiments",key="back_to_experiments",use_container_width=True): return_to_experiment_home()
 with header[1]:
-    exp_name=html.escape(str(st.session_state.get("_active_experiment_name","Experiment"))); st.markdown(f'<div class="lab-header-title">{exp_name}</div><div class="lab-header-subtitle">{mouse_count()} mice · persistent session</div>',unsafe_allow_html=True)
+    exp_name=html.escape(str(st.session_state.get("_active_experiment_name","Experiment")))
+    st.markdown(f'<div class="lab-header-title">{exp_name}</div><div class="lab-header-subtitle">{mouse_count()} mice · persistent session</div>',unsafe_allow_html=True)
 with header[2]: st.button("⛶ Full screen",key="fullscreen_view",use_container_width=True)
 with header[3]:
     available=global_undo_available(); target=global_undo_label(); help_text=f"Undo: {target}" if available else "No action available to undo"
     if st.button("↶ Undo",key=f"global_undo_{global_undo_token()}",use_container_width=True,disabled=not available,help=help_text): global_undo_last_action(); st.rerun()
-with header[4]: st.download_button("⇩ Export timesheets",data=build_all_timesheets_text(),file_name=f"shock_timer_timesheets_{wall_datetime().strftime('%Y-%m-%d')}.txt",mime="text/plain",key="export_timesheets",use_container_width=True)
+with header[4]:
+    st.download_button(
+        "⇩ Export timesheets",
+        data=build_all_timesheets_text(),
+        file_name=timesheet_export_filename(),
+        mime="text/plain",
+        key="export_timesheets",
+        use_container_width=True,
+    )
 with header[5]:
     if st.button("■ End all subjects",key="end_all_subjects",use_container_width=True): end_all_subjects_dialog()
 with header[6]:
