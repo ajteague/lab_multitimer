@@ -14,6 +14,9 @@ Maintenance notes
 * Visual CSS is intentionally installed once in cascade order. Keeping a single
   style element reduces Streamlit DOM overhead while preserving the exact rule
   precedence of prior versions.
+* Refactor pass removes shadowed function definitions, centralizes repeated
+  state/event rules, and avoids duplicate export-time event parsing while preserving
+  database schema, widget keys, session payload names, and visible behavior.
 """
 
 import base64
@@ -35,10 +38,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 # ============================================================
-# APP SETTINGS — V40 keeps the V39 timing/behavior defaults.
+# APP SETTINGS.
 # ============================================================
 
 # Change ONLY this line to switch modes:
@@ -55,6 +57,10 @@ DEFAULT_NOTIFICATION_SOUND_ENABLED = True
 DEFAULT_NOTIFICATION_SOUND = "Chime"
 NOTIFICATION_SOUND_OPTIONS = ["Chime", "Beep", "Double beep"]
 
+# Both the initial anesthetic and each redose are administered at 0.01 mL/g.
+# They are summarized separately in exports because they come from different vials.
+ANESTHESIA_DOSE_VOLUME_ML_PER_G = 0.01
+
 FIXED_BOARD_DURATION = 10
 FIXED_SHOCK_DURATION = 60
 FIXED_RESUSCITATION_DURATION = 20
@@ -62,7 +68,7 @@ FIXED_RESUSCITATION_DURATION = 20
 INITIAL_MOUSE_COUNT = 8
 WARNING_UNITS = 1
 APP_TIMEZONE = "America/New_York"
-STATE_VERSION = "lab_multitimer_v61_refactored"
+STATE_VERSION = "lab_multitimer_v70_reliability_preflight"
 
 UNIT_SECONDS = 1.0 if TIME_UNIT == "seconds" else 60.0
 UNIT_SHORT = "s" if TIME_UNIT == "seconds" else "m"
@@ -78,6 +84,21 @@ RUNNING_ROW_COLUMNS = [1.38, 1.14, 0.74, 3.22, 1.96, 0.18, 1.58]
 RUNNING_ACTION_COLUMNS = [1.0, 0.28]
 HEADER_COLUMNS = [1.02, 4.10, 0.90, 0.88, 1.42, 1.22, 0.88]
 CONFIGURATION_COLUMNS = [0.58, 3.52, 1.58, 0.58]
+
+# Event/state groups used in several timer and audit paths. Centralizing these
+# avoids subtle drift between UI validation, corrections, and pause handling.
+ANESTHESIA_EVENT_NAMES = ("Anesthesia started", "Anesthesia redosed")
+BACKTIME_EDITABLE_EVENTS = frozenset(
+    (*ANESTHESIA_EVENT_NAMES, "Board acclimation started", "Shock started", "Resuscitation started")
+)
+PAUSE_SHIFT_FIELDS = (
+    "experiment_start",
+    "anesthesia_start",
+    "board_start",
+    "shock_start",
+    "resus_start",
+    "anesthesia_due_override",
+)
 
 st.set_page_config(
     page_title="Shock Timer",
@@ -226,11 +247,6 @@ APP_CSS = r"""
     #lab-attention-v40{left:1.35rem!important;right:1.35rem!important;bottom:1rem!important;padding:.72rem .92rem!important;border-radius:11px!important;background:rgba(11,20,30,.97)!important;border:1px solid rgba(245,161,38,.30)!important;box-shadow:0 16px 48px rgba(0,0,0,.36)!important;color:#e8edf2!important;font:650 13px/1.25 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important}
     #lab-attention-v40 .orange{color:#ffc169!important}#lab-attention-v40 .red{color:#ff9cab!important}#lab-attention-v40 .x{color:#99a6b3!important;cursor:pointer;float:right}
     @media(max-width:1180px){.stMainBlockContainer{min-width:1140px}}
-
-    /* =========================================================
-       V40 COMPACT DENSITY PASS
-       Same selected design; optimized to show more channels.
-       ========================================================= */
 
     .stMainBlockContainer{
         padding:.62rem 1.20rem 4.75rem!important;
@@ -416,9 +432,6 @@ APP_CSS = r"""
         .lab-cell,.lab-mouse-wrap{min-height:3.92rem!important}
     }
 
-    
-
-    /* ---------------- Home header ---------------- */
     .home-brand {
         display:flex;
         align-items:center;
@@ -459,7 +472,6 @@ APP_CSS = r"""
         margin-top:.22rem;
     }
 
-    /* Compact warning only when cloud storage is unavailable. */
     div[class*="st-key-home_cloud_warning"] [data-testid="stAlert"] {
         min-height:auto!important;
         padding:.52rem .72rem!important;
@@ -473,7 +485,6 @@ APP_CSS = r"""
         line-height:1.18!important;
     }
 
-    /* ---------------- Major home cards ---------------- */
     div[class*="st-key-home_new_experiment"],
     div[class*="st-key-home_active_section"],
     div[class*="st-key-home_completed_section"] {
@@ -520,7 +531,6 @@ APP_CSS = r"""
         margin-left:.34rem;
     }
 
-    /* ---------------- New experiment row ---------------- */
     div[class*="st-key-home_new_experiment"] [data-testid="stForm"] {
         padding:0!important;
         border:0!important;
@@ -560,7 +570,6 @@ APP_CSS = r"""
         border-color:#ffad36!important;
     }
 
-    /* ---------------- Experiment rows ---------------- */
     div[class*="st-key-home_exp_card_"] {
         background:linear-gradient(180deg,rgba(13,24,36,.68),rgba(10,19,29,.68))!important;
         border:1px solid rgba(137,160,184,.16)!important;
@@ -625,7 +634,6 @@ APP_CSS = r"""
         text-overflow:ellipsis;
     }
 
-    /* Smaller, quieter management actions. */
     div[class*="st-key-home_exp_card_"] .stButton>button {
         min-height:2.30rem!important;
         height:2.30rem!important;
@@ -642,7 +650,6 @@ APP_CSS = r"""
         border-color:rgba(152,178,204,.36)!important;
     }
 
-    /* Delete is the only consistently destructive control on the home list. */
     div[class*="st-key-home_delete_"] button {
         color:#ff8e9e!important;
         border-color:rgba(239,101,120,.52)!important;
@@ -654,14 +661,12 @@ APP_CSS = r"""
         background:rgba(239,101,120,.07)!important;
     }
 
-    /* Empty states stay quiet inside the card. */
     .home-empty-state {
         color:#718090;
         font-size:.72rem;
         padding:.42rem .10rem .26rem;
     }
 
-    /* Error messages from new-experiment validation remain compact. */
     div[class*="st-key-home_new_experiment"] [data-testid="stAlert"] {
         padding:.48rem .64rem!important;
         margin-top:.18rem!important;
@@ -670,9 +675,7 @@ APP_CSS = r"""
     @media(max-width:1180px) {
         .home-exp-meta { font-size:.63rem; }
     }
-    
 
-    /* ---------- Home screen text / button balance ---------- */
     .home-brand-title{
         font-size:1.74rem!important;
         line-height:1.00!important;
@@ -734,7 +737,6 @@ APP_CSS = r"""
         padding:0 .52rem!important;
     }
 
-    /* ---------- Configure experiment dialog ---------- */
     .cfg-dialog-name{
         color:#eef3f7!important;
         font-size:1.02rem!important;
@@ -839,9 +841,7 @@ APP_CSS = r"""
     [data-testid="stDialog"] [role="dialog"]{
         padding-top:.18rem!important;
     }
-    
 
-    /* Dialog intro block: prevent stacking/overlap and create clear hierarchy */
     div[class*="st-key-cfg_dialog_intro"]{
         margin:.08rem 0 .46rem!important;
         padding:.02rem 0 .04rem!important;
@@ -861,7 +861,6 @@ APP_CSS = r"""
         margin:0!important;
     }
 
-    /* Keep headers clearly separated from the first row */
     .st-key-configuration_table [data-testid="stVerticalBlock"]{
         gap:.20rem!important;
     }
@@ -881,7 +880,6 @@ APP_CSS = r"""
         align-items:flex-end!important;
     }
 
-    /* Row shell */
     div[class*="st-key-cfg_row_shell_"]{
         background:linear-gradient(180deg,rgba(13,24,36,.66),rgba(10,19,29,.66))!important;
         border:1px solid rgba(137,160,184,.15)!important;
@@ -890,7 +888,6 @@ APP_CSS = r"""
         margin:.03rem 0!important;
     }
 
-    /* Left index alignment */
     .cfg-index-cell{
         min-height:2.42rem!important;
         display:flex!important;
@@ -921,7 +918,6 @@ APP_CSS = r"""
         padding:0!important;
     }
 
-    /* Add mouse and footer buttons */
     div[class*="st-key-cfg_add_mouse_wrap"]{
         margin-top:.10rem!important;
         margin-bottom:.10rem!important;
@@ -946,13 +942,10 @@ APP_CSS = r"""
         font-weight:720!important;
     }
 
-    /* Ensure the dialog itself has enough top breathing room */
     [data-testid="stDialog"] [role="dialog"]{
         padding-top:.22rem!important;
     }
-    
 
-    /* Separate the anesthesia status/weight from the redose controls. */
     .lab-anesthesia-copy{
         min-height:2.28rem!important;
         margin:0 0 .24rem 0!important;
@@ -963,19 +956,12 @@ APP_CSS = r"""
         margin-top:.08rem!important;
     }
 
-    /* Keep the two anesthesia buttons visually grouped, but not crowded. */
     div[class*="st-key-anesthesia_redose_action_"],
     div[class*="st-key-anesthesia_delay_action_"]{
         padding-top:.02rem!important;
         padding-bottom:.02rem!important;
     }
-    
 
-    /*
-      The previous layout let the weight line visually intrude into the button
-      row. Give the label, reminder, and weight three explicit rows and reserve
-      real vertical space before the controls.
-    */
     .lab-anesthesia-copy{
         display:grid!important;
         grid-template-rows:auto auto auto!important;
@@ -1034,9 +1020,7 @@ APP_CSS = r"""
         min-height:1.90rem!important;
         height:1.90rem!important;
     }
-    
 
-    /* ---------- Subject identity / starting MAP ---------- */
     .lab-subject-copy{
         min-width:0!important;
         display:flex!important;
@@ -1053,7 +1037,6 @@ APP_CSS = r"""
         white-space:nowrap!important;
     }
 
-    /* ---------- Anesthesia status ---------- */
     .lab-anesthesia-copy{
         display:block!important;
         min-height:0!important;
@@ -1103,13 +1086,10 @@ APP_CSS = r"""
         text-align:right!important;
     }
 
-    /* The old V48 weight row must not participate in layout if any
-       stale markup survives a rerun during development. */
     .lab-anesthesia-weight{
         display:none!important;
     }
 
-    /* Explicit breathing room between status line and buttons. */
     div[class*="st-key-anesthesia_controls_"]{
         margin-top:.20rem!important;
         padding-top:.04rem!important;
@@ -1124,9 +1104,7 @@ APP_CSS = r"""
     div[class*="st-key-anesthesia_delay_action_"] button{
         margin:0!important;
     }
-    
 
-    /* Make the weight visually equal to the redose timer text. */
     .lab-anesthesia-weight-inline{
         color:#eef2f5!important;
         font-size:.79rem!important;
@@ -1136,7 +1114,6 @@ APP_CSS = r"""
         text-align:right!important;
     }
 
-    /* Add real breathing room before the Redose / Delay controls. */
     .lab-anesthesia-copy{
         padding-bottom:.52rem!important;
     }
@@ -1145,14 +1122,7 @@ APP_CSS = r"""
         margin-top:.28rem!important;
         padding-top:.06rem!important;
     }
-    
 
-    /*
-      Give the timer/weight row a clearly separate visual band from
-      the Redose / Delay controls. The buttons are made slightly
-      shorter so the added whitespace does not unnecessarily inflate
-      the overall subject row.
-    */
     .lab-anesthesia-copy{
         padding-bottom:.72rem!important;
     }
@@ -1177,12 +1147,7 @@ APP_CSS = r"""
         font-weight:680!important;
         margin:0!important;
     }
-    
 
-    /*
-      The anesthesia/action side can make a subject card taller than the first
-      three columns. Explicitly stretch those columns and center their contents.
-    */
     div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(1),
     div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(2),
     div[class*="st-key-mouse_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(3){
@@ -1213,12 +1178,7 @@ APP_CSS = r"""
         line-height:1.12!important;
         margin-top:.22rem!important;
     }
-    
 
-    /*
-      Always reserve the Starting MAP line. Before a value exists the text is
-      invisible, so Mouse N never jumps when the MAP is later recorded.
-    */
     .lab-starting-map{
         min-height:.82rem!important;
         height:.82rem!important;
@@ -1233,11 +1193,8 @@ APP_CSS = r"""
         user-select:none!important;
     }
 
-    /*
-      Reminder audio is rendered by Streamlit so it uses the same browser path
-      as the working Settings sound preview. Hide only the player chrome.
-    */
-    div[class*="st-key-overdue_sound_"]{
+    div[class*="st-key-overdue_sound_"],
+    div[class*="st-key-hidden_audio_"]{
         position:absolute!important;
         width:1px!important;
         height:1px!important;
@@ -1246,16 +1203,12 @@ APP_CSS = r"""
         pointer-events:none!important;
     }
 
-    div[class*="st-key-overdue_sound_"] audio{
+    div[class*="st-key-overdue_sound_"] audio,
+    div[class*="st-key-hidden_audio_"] audio{
         width:1px!important;
         height:1px!important;
     }
-    
 
-    /*
-      Mouse status dot, mouse icon, mouse name, Next Event value/timer,
-      and Total value now share the same vertical center line.
-    */
     .lab-mouse-wrap{
         position:relative!important;
         align-items:center!important;
@@ -1282,10 +1235,6 @@ APP_CSS = r"""
         margin:0!important;
     }
 
-    /*
-      MAP and Paused labels are annotations around the fixed subject-name
-      anchor; they never change the Mouse N position.
-    */
     .lab-starting-map{
         position:absolute!important;
         top:1.30rem!important;
@@ -1320,10 +1269,6 @@ APP_CSS = r"""
         line-height:1.05!important;
     }
 
-    /*
-      Labels float above the centered value instead of pushing the timer
-      downward. This is what aligns the actual timer/value with Mouse N.
-    */
     .lab-next-single-label,
     .lab-total-cell > .lab-mini-label{
         position:absolute!important;
@@ -1354,14 +1299,7 @@ APP_CSS = r"""
     .lab-next-time{
         margin:0!important;
     }
-    
 
-    /* ---------------------------------------------------------
-       Subject identity
-       Keep a permanent two-line subject block so adding Starting
-       MAP never moves the mouse label, but center the NAME + MAP
-       combination as a whole within the row.
-       --------------------------------------------------------- */
     .lab-subject-copy{
         position:relative!important;
         display:flex!important;
@@ -1395,7 +1333,6 @@ APP_CSS = r"""
         visibility:hidden!important;
     }
 
-    /* Keep pause as an annotation without disturbing the centered block. */
     .lab-paused-label{
         position:absolute!important;
         left:0!important;
@@ -1403,11 +1340,6 @@ APP_CSS = r"""
         margin:0!important;
     }
 
-    /* ---------------------------------------------------------
-       Next event spacing
-       Move the entire Next Event content slightly to the right so
-       the subject identity and next-event groups do not crowd.
-       --------------------------------------------------------- */
     .lab-next-event-cell{
         padding-left:.42rem!important;
         box-sizing:border-box!important;
@@ -1425,13 +1357,6 @@ APP_CSS = r"""
         margin-left:.42rem!important;
     }
 
-    /* ---------------------------------------------------------
-       Redose state visibility
-       Normal = quiet orange outline.
-       Warning = stronger amber.
-       Overdue = unmistakable red/pink status + red Redose button.
-       Delay remains purple so the two actions stay visually distinct.
-       --------------------------------------------------------- */
     div[class*="st-key-mouse_row_"]:has(.anesthesia-tone-orange)
     div[class*="st-key-anesthesia_redose_action_"] button{
         color:#ffd18a!important;
@@ -1478,14 +1403,7 @@ APP_CSS = r"""
         )!important;
         border-color:#ff7d90!important;
     }
-    
 
-    /*
-      Make the first three columns behave like consistent stacked blocks so
-      their internal horizontal guides line up across every row.
-    */
-
-    /* ---------- Subject column ---------- */
     .lab-mouse-wrap{
         min-height:3.20rem!important;
         display:flex!important;
@@ -1542,7 +1460,6 @@ APP_CSS = r"""
         margin:0!important;
     }
 
-    /* ---------- Next event column ---------- */
     .lab-next-event-cell{
         display:grid!important;
         grid-template-rows:auto auto!important;
@@ -1588,7 +1505,6 @@ APP_CSS = r"""
         line-height:1.06!important;
     }
 
-    /* ---------- Total column ---------- */
     .lab-total-cell{
         display:grid!important;
         grid-template-rows:auto auto!important;
@@ -1614,21 +1530,11 @@ APP_CSS = r"""
         line-height:1.06!important;
     }
 
-    /* Remove old centering behavior that could fight the grid alignment. */
     .lab-cell{
         margin-top:0!important;
         margin-bottom:0!important;
     }
-    
 
-    /* ---------------------------------------------------------
-       SUBJECT
-       Two permanent rows:
-         Mouse N
-         Starting MAP (invisible placeholder until available)
-
-       Dot and mouse icon are anchored to the Mouse N row only.
-       --------------------------------------------------------- */
     .lab-mouse-wrap{
         min-height:2.34rem!important;
         height:2.34rem!important;
@@ -1683,7 +1589,6 @@ APP_CSS = r"""
         visibility:hidden!important;
     }
 
-    /* Center these against the Mouse N line, not the two-line subject block. */
     .lab-dot{
         flex:0 0 auto!important;
         margin-top:.27rem!important;
@@ -1694,14 +1599,6 @@ APP_CSS = r"""
         margin-top:-.31rem!important;
     }
 
-    /* ---------------------------------------------------------
-       NEXT EVENT
-       Exactly two permanent rows for every state:
-         NEXT EVENT
-         event/value
-
-       This prevents the block from moving when a timer starts.
-       --------------------------------------------------------- */
     .lab-next-event-cell{
         display:grid!important;
         grid-template-rows:.72rem 1.10rem!important;
@@ -1757,7 +1654,6 @@ APP_CSS = r"""
     .lab-next-metric.green{color:#73dc87!important}
     .lab-next-metric.gray{color:#8d99a6!important}
 
-    /* Kill old absolute-position rules from earlier versions. */
     .lab-next-overline,
     .lab-next-single-label{
         position:static!important;
@@ -1772,10 +1668,6 @@ APP_CSS = r"""
         padding:0!important;
     }
 
-    /* ---------------------------------------------------------
-       TOTAL
-       Same fixed two-row geometry as Next Event.
-       --------------------------------------------------------- */
     .lab-total-cell{
         display:grid!important;
         grid-template-rows:.72rem 1.10rem!important;
@@ -1804,20 +1696,13 @@ APP_CSS = r"""
         padding:0!important;
     }
 
-    /* Keep pause as an annotation, without changing the fixed subject grid. */
     .lab-paused-label{
         position:absolute!important;
         left:0!important;
         bottom:2.42rem!important;
         margin:0!important;
     }
-    
 
-    /*
-      The second row under NEXT EVENT now has one fixed typography
-      regardless of state: not started, countdown, warning, or overdue.
-      It matches the Starting MAP line under the subject name.
-    */
     .lab-next-inline,
     .lab-next-inline.lab-primary-text,
     .lab-next-copy,
@@ -1832,7 +1717,6 @@ APP_CSS = r"""
         white-space:nowrap!important;
     }
 
-    /* Preserve only the state color; never change size/weight by state. */
     .lab-next-inline.gray,
     .lab-next-metric.gray{
         color:#8d99a6!important;
@@ -1852,7 +1736,240 @@ APP_CSS = r"""
     .lab-next-metric.red{
         color:#ff8798!important;
     }
-    
+
+    div[class*="st-key-anesthesia_redose_action_"] button:disabled,
+    div[class*="st-key-anesthesia_delay_action_"] button:disabled{
+        color:rgba(190,201,212,.36)!important;
+        border-color:rgba(137,160,184,.10)!important;
+        background:rgba(137,160,184,.025)!important;
+        box-shadow:none!important;
+        opacity:.72!important;
+    }
+
+    .ts-title{
+        color:#f6f9fc!important;
+        font-size:1.08rem!important;
+        font-weight:760!important;
+        letter-spacing:-.015em!important;
+        margin:.06rem 0 .56rem!important;
+    }
+
+    .ts-summary-grid{
+        display:grid!important;
+        grid-template-columns:repeat(4,minmax(0,1fr))!important;
+        gap:.62rem!important;
+        margin:.10rem 0 .92rem!important;
+    }
+
+    .ts-summary-card{
+        min-width:0!important;
+        padding:.68rem .76rem!important;
+        border:1px solid rgba(137,160,184,.18)!important;
+        border-radius:9px!important;
+        background:linear-gradient(
+            180deg,
+            rgba(16,29,42,.86),
+            rgba(11,22,33,.86)
+        )!important;
+    }
+
+    .ts-summary-label{
+        color:#94a6b8!important;
+        font-size:.67rem!important;
+        font-weight:730!important;
+        text-transform:uppercase!important;
+        letter-spacing:.055em!important;
+        line-height:1.05!important;
+        margin-bottom:.28rem!important;
+        white-space:nowrap!important;
+    }
+
+    .ts-summary-value{
+        color:#f3f7fa!important;
+        font-size:.91rem!important;
+        font-weight:740!important;
+        line-height:1.10!important;
+        white-space:nowrap!important;
+    }
+
+    .ts-section-title{
+        color:#f1f5f8!important;
+        font-size:.90rem!important;
+        font-weight:740!important;
+        line-height:1.10!important;
+        margin:.76rem 0 .34rem!important;
+    }
+
+    .ts-note{
+        color:#9eafbf!important;
+        font-size:.72rem!important;
+        line-height:1.30!important;
+        margin:.08rem 0 .52rem!important;
+    }
+
+    .ts-table-wrap{
+        width:100%!important;
+        overflow-x:auto!important;
+        border:1px solid rgba(137,160,184,.16)!important;
+        border-radius:9px!important;
+        background:rgba(9,19,29,.44)!important;
+        margin:.08rem 0 .74rem!important;
+    }
+
+    .ts-table{
+        width:100%!important;
+        border-collapse:collapse!important;
+        table-layout:fixed!important;
+        font-variant-numeric:tabular-nums!important;
+    }
+
+    .ts-table th{
+        color:#a9b8c7!important;
+        background:rgba(137,160,184,.055)!important;
+        font-size:.63rem!important;
+        font-weight:770!important;
+        text-transform:uppercase!important;
+        letter-spacing:.055em!important;
+        line-height:1.05!important;
+        text-align:left!important;
+        padding:.54rem .60rem!important;
+        border-bottom:1px solid rgba(137,160,184,.17)!important;
+        white-space:nowrap!important;
+    }
+
+    .ts-table td{
+        color:#d7e1ea!important;
+        font-size:.73rem!important;
+        font-weight:560!important;
+        line-height:1.22!important;
+        padding:.52rem .60rem!important;
+        border-bottom:1px solid rgba(137,160,184,.09)!important;
+        vertical-align:middle!important;
+        white-space:nowrap!important;
+        overflow:hidden!important;
+        text-overflow:ellipsis!important;
+    }
+
+    .ts-table tr:last-child td{
+        border-bottom:0!important;
+    }
+
+    .ts-table td.ts-strong{
+        color:#f1f5f8!important;
+        font-weight:690!important;
+    }
+
+    div[class*="st-key-timesheet_event_header_"]{
+        padding:.38rem .44rem!important;
+        margin:.06rem 0 .06rem!important;
+        border-top:1px solid rgba(137,160,184,.15)!important;
+        border-bottom:1px solid rgba(137,160,184,.15)!important;
+        background:rgba(137,160,184,.045)!important;
+        border-radius:7px 7px 0 0!important;
+    }
+
+    div[class*="st-key-timesheet_event_header_"] [data-testid="stHorizontalBlock"]{
+        gap:.62rem!important;
+        align-items:center!important;
+    }
+
+    .ts-event-header{
+        min-height:1.08rem!important;
+        display:flex!important;
+        align-items:center!important;
+        color:#a9b8c7!important;
+        font-size:.62rem!important;
+        font-weight:770!important;
+        text-transform:uppercase!important;
+        letter-spacing:.055em!important;
+        line-height:1!important;
+        white-space:nowrap!important;
+    }
+
+    div[class*="st-key-timesheet_event_row_"]{
+        padding:.40rem .44rem!important;
+        margin:0!important;
+        border-bottom:1px solid rgba(137,160,184,.09)!important;
+        background:rgba(8,18,28,.18)!important;
+    }
+
+    div[class*="st-key-timesheet_event_row_"]:last-of-type{
+        border-radius:0 0 7px 7px!important;
+    }
+
+    div[class*="st-key-timesheet_event_row_"] [data-testid="stHorizontalBlock"]{
+        gap:.62rem!important;
+        align-items:center!important;
+    }
+
+    .ts-event-cell{
+        min-height:2.10rem!important;
+        display:flex!important;
+        align-items:center!important;
+        color:#cbd7e1!important;
+        font-size:.72rem!important;
+        font-weight:560!important;
+        line-height:1.25!important;
+        font-variant-numeric:tabular-nums!important;
+        word-break:break-word!important;
+    }
+
+    .ts-event-cell.primary{
+        color:#f0f4f8!important;
+        font-size:.76rem!important;
+        font-weight:690!important;
+    }
+
+    .ts-event-cell.details{
+        color:#bcc9d5!important;
+        white-space:normal!important;
+    }
+
+    div[class*="st-key-timesheet_event_row_"] .stButton>button{
+        min-height:2.12rem!important;
+        height:2.12rem!important;
+        padding:0 .52rem!important;
+        border-radius:8px!important;
+        font-size:.70rem!important;
+        font-weight:670!important;
+        white-space:nowrap!important;
+    }
+
+    .ts-adjust-placeholder{
+        min-height:2.12rem!important;
+    }
+
+    div[class*="st-key-timesheet_backtime_panel_"]{
+        margin-top:.72rem!important;
+        padding:.74rem .78rem!important;
+        border:1px solid rgba(137,160,184,.17)!important;
+        border-radius:9px!important;
+        background:rgba(13,24,35,.66)!important;
+    }
+
+    div[class*="st-key-timesheet_backtime_panel_"] [data-testid="stWidgetLabel"] p{
+        color:#c0ccd7!important;
+    }
+
+    @media(max-width:1180px){
+        .ts-summary-grid{
+            grid-template-columns:repeat(2,minmax(0,1fr))!important;
+        }
+    }
+
+    .preflight-browser-status{
+        margin:.42rem 0 .62rem!important;
+        padding:.58rem .68rem!important;
+        border:1px solid rgba(137,160,184,.18)!important;
+        border-radius:9px!important;
+        background:rgba(12,23,34,.72)!important;
+        color:#cbd6e0!important;
+        font-size:.74rem!important;
+        line-height:1.35!important;
+    }
+    .preflight-browser-status .ok{color:#92dfa0!important;font-weight:700!important}
+    .preflight-browser-status .warn{color:#ffc169!important;font-weight:700!important}
+
 """
 
 
@@ -1861,7 +1978,6 @@ def install_app_styles():
     st.markdown("<style>" + APP_CSS + "</style>", unsafe_allow_html=True)
 
 
-install_app_styles()
 
 # ============================================================
 # TIME / STATE HELPERS
@@ -1903,6 +2019,7 @@ def mouse_defaults(i):
         f"notification_sound_{i}":DEFAULT_NOTIFICATION_SOUND,
         f"event_log_{i}":[], f"subject_name_{i}":f"Mouse {i}", f"mouse_weight_g_{i}":None,
         f"starting_map_mmhg_{i}":None, f"ending_map_mmhg_{i}":None,
+        f"shock_volume_ml_{i}":None, f"resuscitation_volume_ml_{i}":None,
         f"display_order_{i}":i, f"undo_history_{i}":[],
     }
 
@@ -1922,42 +2039,63 @@ def initialize_state():
     st.session_state.setdefault("_needs_full_rerun", False)
     st.session_state.setdefault("_unsaved_subjects", [])
     st.session_state.setdefault("_global_undo_history", [])
+    st.session_state.setdefault("_show_storage_exit_dialog", False)
+    st.session_state.setdefault("_pending_run_preflight", None)
     for i in range(1, int(st.session_state["_mouse_count"]) + 1): initialize_mouse_state(i)
 
 def mouse_count(): return int(st.session_state.get("_mouse_count", INITIAL_MOUSE_COUNT))
 def subject_name(i): return str(st.session_state.get(f"subject_name_{i}", f"Mouse {i}")).strip() or f"Mouse {i}"
-def mouse_weight(i):
+def _subject_float(i, field):
+    """Return a per-subject numeric value as float, or ``None`` when unset."""
     try:
-        v=st.session_state.get(f"mouse_weight_g_{i}"); return None if v is None else float(v)
-    except (TypeError,ValueError): return None
+        value = st.session_state.get(f"{field}_{i}")
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def mouse_weight(i):
+    return _subject_float(i, "mouse_weight_g")
+
 
 def weight_label(i):
-    v=mouse_weight(i); return "Weight —" if v is None or v <= 0 else f"{v:.1f} g"
+    value = mouse_weight(i)
+    return "Weight —" if value is None or value <= 0 else f"{value:.1f} g"
+
 
 def _random_test_weight():
     return round(random.uniform(TEST_WEIGHT_MIN_G, TEST_WEIGHT_MAX_G), 1)
 
+
 def _default_entry_weight():
     return _random_test_weight() if TESTING_MODE else 0.0
 
+
 def starting_map(i):
-    try:
-        value=st.session_state.get(f"starting_map_mmhg_{i}")
-        return None if value is None else float(value)
-    except (TypeError,ValueError):
-        return None
+    return _subject_float(i, "starting_map_mmhg")
+
 
 def ending_map(i):
-    try:
-        value=st.session_state.get(f"ending_map_mmhg_{i}")
-        return None if value is None else float(value)
-    except (TypeError,ValueError):
-        return None
+    return _subject_float(i, "ending_map_mmhg")
+
+
+def shock_volume(i):
+    return _subject_float(i, "shock_volume_ml")
+
+
+def resuscitation_volume(i):
+    return _subject_float(i, "resuscitation_volume_ml")
 
 def _map_summary(i):
     start=starting_map(i); end=ending_map(i); parts=[]
     if start is not None: parts.append(f"Starting MAP {start:g} mmHg")
     if end is not None: parts.append(f"Ending MAP {end:g} mmHg")
+    return " · ".join(parts)
+
+def _volume_summary(i):
+    shock=shock_volume(i); resus=resuscitation_volume(i); parts=[]
+    if shock is not None: parts.append(f"Shock volume removed {shock:g} mL")
+    if resus is not None: parts.append(f"Resuscitation volume given {resus:g} mL")
     return " · ".join(parts)
 
 def ordered_subject_indices():
@@ -2044,7 +2182,6 @@ def initialize_database():
         except Exception: pass
     return True
 
-initialize_database()
 
 def _default_subject_payload(i): return {k:_copy_value(v) for k,v in mouse_defaults(i).items()}
 def _subject_payload(i): return {k:_copy_value(st.session_state.get(k,v)) for k,v in mouse_defaults(i).items()}
@@ -2108,8 +2245,65 @@ def persist_subjects(indices):
 
 def persist_subject(i): return persist_subjects([i])
 def retry_unsaved_subjects():
+    """Retry pending subject saves and report whether all changes are confirmed."""
     pending=list(st.session_state.get("_unsaved_subjects",[]))
-    if pending: persist_subjects(pending)
+    if pending:
+        persist_subjects(pending)
+    return not bool(st.session_state.get("_unsaved_subjects",[]))
+
+def build_emergency_backup_text():
+    """
+    Build a standalone recovery file containing the complete in-memory subject
+    state plus the human-readable timesheet. This is intentionally independent
+    of database persistence so a failed save never traps the only copy in the UI.
+    """
+    indices=ordered_subject_indices()
+    backup={
+        "backup_format":"shock_timer_emergency_backup_v1",
+        "state_version":STATE_VERSION,
+        "created_at":wall_datetime().isoformat(),
+        "timezone":APP_TIMEZONE,
+        "database_kind":DATABASE_KIND,
+        "experiment":{
+            "id":st.session_state.get("_active_experiment_id"),
+            "name":st.session_state.get("_active_experiment_name"),
+            "mouse_count":mouse_count(),
+        },
+        "unsaved_subjects":list(st.session_state.get("_unsaved_subjects",[])),
+        "storage_error":st.session_state.get("_storage_error"),
+        "subjects":{
+            str(i):_subject_payload(i)
+            for i in indices
+        },
+        "timesheet_text":build_all_timesheets_text(),
+    }
+    return json.dumps(backup,indent=2,ensure_ascii=False)
+
+def emergency_backup_filename():
+    name=re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        str(st.session_state.get("_active_experiment_name","experiment")).strip(),
+    ).strip("_") or "experiment"
+    return (
+        f"{name}_EMERGENCY_BACKUP_"
+        f"{wall_datetime().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+
+def storage_preflight_check():
+    """Confirm that the configured persistence backend is currently reachable."""
+    try:
+        rows=_db_query("SELECT 1 AS ok")
+        if not rows:
+            return False,"Storage check returned no response."
+        label=(
+            "Cloud database reachable"
+            if DATABASE_KIND=="postgres"
+            else "Local SQLite storage reachable"
+        )
+        return True,label
+    except Exception as exc:
+        return False,str(exc)
 
 def rename_experiment_record(exp_id,new_name):
     new_name=(new_name or "").strip()
@@ -2157,38 +2351,86 @@ def event_epoch(entry):
 def _format_relative(seconds):
     sign="-" if seconds<0 else "+"; seconds=abs(seconds); return sign+format_total_elapsed(seconds)
 
-def relative_time_map(i,log):
-    base=st.session_state.get(f"experiment_start_{i}")
-    epochs=[event_epoch(e) for e in log if event_epoch(e) is not None]
-    if base is None and epochs: base=min(epochs)
-    result={}
-    for order,e in enumerate(log):
-        ep=event_epoch(e); value="—" if ep is None or base is None else _format_relative(ep-float(base)); key=e.get("_id") or f"__order_{order}"; result[key]=value
+def relative_time_map(i, log):
+    """Map each event id to its relative time without reparsing timestamps."""
+    base = st.session_state.get(f"experiment_start_{i}")
+    parsed_epochs = [event_epoch(event) for event in log]
+    valid_epochs = [epoch for epoch in parsed_epochs if epoch is not None]
+    if base is None and valid_epochs:
+        base = min(valid_epochs)
+
+    result = {}
+    for order, (event, epoch) in enumerate(zip(log, parsed_epochs)):
+        value = (
+            "—"
+            if epoch is None or base is None
+            else _format_relative(epoch - float(base))
+        )
+        key = event.get("_id") or f"__order_{order}"
+        result[key] = value
     return result
 
-def is_backtime_editable_event(entry): return entry.get("Event") in {"Anesthesia started","Anesthesia redosed","Board acclimation started","Shock started","Resuscitation started"}
+def is_backtime_editable_event(entry):
+    return entry.get("Event") in BACKTIME_EDITABLE_EVENTS
 
-def backtime_start_event(i,event_id,amount):
-    try: amount=float(amount)
-    except (TypeError,ValueError): return False,f"Enter a valid number of {UNIT_WORD}."
-    if amount<=0: return False,f"Back-time must be greater than 0 {UNIT_WORD}."
-    key=f"event_log_{i}"; log=list(st.session_state.get(key,[])); idx=next((n for n,e in enumerate(log) if e.get("_id")==event_id),None)
-    if idx is None: return False,"That event could not be found."
-    entry=dict(log[idx])
-    if not is_backtime_editable_event(entry): return False,"That event is not a timer start and cannot be back-timed here."
-    old=event_epoch(entry)
-    if old is None: return False,"The saved event time could not be parsed."
-    new=old-duration_to_seconds(amount); name=entry.get("Event"); _record_global_undo(f"Back-time {name} — {subject_name(i)}",[i]); entry["_epoch"]=new; entry["Absolute time"]=wall_datetime(new).strftime("%Y-%m-%d %H:%M:%S"); log[idx]=entry; st.session_state[key]=log
-    if name=="Board acclimation started": st.session_state[f"board_start_{i}"]=new
-    elif name=="Shock started": st.session_state[f"shock_start_{i}"]=new; st.session_state[f"shock_wallclock_{i}"]=wall_datetime(new).strftime("%H:%M:%S")
-    elif name=="Resuscitation started": st.session_state[f"resus_start_{i}"]=new
-    elif name in ("Anesthesia started","Anesthesia redosed"):
-        ae=[x for x in log if x.get("Event") in ("Anesthesia started","Anesthesia redosed")]
-        if ae and ae[-1].get("_id")==event_id: st.session_state[f"anesthesia_start_{i}"]=new
-        if name=="Anesthesia started":
-            cur=st.session_state.get(f"experiment_start_{i}")
-            if cur is None or new<float(cur): st.session_state[f"experiment_start_{i}"]=new
-    log_event(i,"Time correction",f"{name} moved {amount:g} {UNIT_WORD} earlier"); persist_subject(i); clear_mouse_alerts(i); st.session_state["_needs_full_rerun"]=True; return True,None
+def backtime_start_event(i, event_id, minutes):
+    """Move a timer-start event earlier by the requested number of minutes."""
+    try:
+        minutes = float(minutes)
+    except (TypeError, ValueError):
+        return False, "Enter a valid number of minutes."
+    if minutes <= 0:
+        return False, "Back-time must be greater than 0 minutes."
+
+    key = f"event_log_{i}"
+    log = list(st.session_state.get(key, []))
+    index = next(
+        (position for position, event in enumerate(log) if event.get("_id") == event_id),
+        None,
+    )
+    if index is None:
+        return False, "That event could not be found."
+
+    entry = dict(log[index])
+    if not is_backtime_editable_event(entry):
+        return False, "That event is not a timer start and cannot be back-timed here."
+
+    old_epoch = event_epoch(entry)
+    if old_epoch is None:
+        return False, "The saved event time could not be parsed."
+
+    new_epoch = old_epoch - minutes * 60.0
+    event_name = entry.get("Event")
+    _record_global_undo(f"Back-time {event_name} — {subject_name(i)}", [i])
+
+    entry["_epoch"] = new_epoch
+    entry["Absolute time"] = wall_datetime(new_epoch).strftime("%Y-%m-%d %H:%M:%S")
+    log[index] = entry
+    st.session_state[key] = log
+
+    if event_name == "Board acclimation started":
+        st.session_state[f"board_start_{i}"] = new_epoch
+    elif event_name == "Shock started":
+        st.session_state[f"shock_start_{i}"] = new_epoch
+        st.session_state[f"shock_wallclock_{i}"] = wall_datetime(new_epoch).strftime("%H:%M:%S")
+    elif event_name == "Resuscitation started":
+        st.session_state[f"resus_start_{i}"] = new_epoch
+    elif event_name in ANESTHESIA_EVENT_NAMES:
+        anesthesia_events = [
+            event for event in log if event.get("Event") in ANESTHESIA_EVENT_NAMES
+        ]
+        if anesthesia_events and anesthesia_events[-1].get("_id") == event_id:
+            st.session_state[f"anesthesia_start_{i}"] = new_epoch
+        if event_name == "Anesthesia started":
+            current_start = st.session_state.get(f"experiment_start_{i}")
+            if current_start is None or new_epoch < float(current_start):
+                st.session_state[f"experiment_start_{i}"] = new_epoch
+
+    log_event(i, "Time correction", f"{event_name} moved {minutes:g} min earlier")
+    persist_subject(i)
+    clear_mouse_alerts(i)
+    st.session_state["_needs_full_rerun"] = True
+    return True, None
 
 def _anesthesia_event_weight(i,event):
     """Return the weight associated with an anesthesia event."""
@@ -2221,160 +2463,253 @@ def anesthesia_summary_rows(i):
 
     for order,event in enumerate(log):
         event_name=str(event.get("Event",""))
-        if event_name not in ("Anesthesia started","Anesthesia redosed"):
+        if event_name not in ANESTHESIA_EVENT_NAMES:
             continue
 
         dose_number += 1
         weight=_anesthesia_event_weight(i,event)
+        dose_volume_ml=(
+            None
+            if weight is None
+            else float(weight)*ANESTHESIA_DOSE_VOLUME_ML_PER_G
+        )
         rows.append({
             "dose":dose_number,
             "type":"Initial" if event_name=="Anesthesia started" else "Redose",
             "relative":rel.get(event.get("_id"),rel.get(f"__order_{order}","—")),
             "absolute":str(event.get("Absolute time","")),
+            "weight_g":weight,
             "weight":"—" if weight is None else f"{weight:.1f} g",
+            "volume_ml":dose_volume_ml,
+            "volume":"—" if dose_volume_ml is None else f"{dose_volume_ml:.3f} mL",
         })
 
     return rows
 
-def _append_payload_event(payload,i,event_name,details,epoch):
-    key=f"event_log_{i}"; log=list(payload.get(key,[])); log.append({"_id":uuid.uuid4().hex,"Event":event_name,"Absolute time":wall_datetime(epoch).strftime("%Y-%m-%d %H:%M:%S"),"Details":details,"_epoch":float(epoch)}); payload[key]=log
+def anesthesia_usage_totals(indices=None, rows_by_subject=None):
+    """Summarize administration count and total volume by anesthetic vial."""
+    if indices is None:
+        indices = ordered_subject_indices()
 
-def end_experiment_record(exp_id):
-    rows=get_subject_records(exp_id); now=time.time(); payloads={}
-    for row in rows:
-        i=int(row["mouse_index"])
-        try: p=json.loads(row["state_json"])
-        except Exception: p=_default_subject_payload(i)
-        if not bool(p.get(f"ended_{i}",False)):
-            p[f"ended_{i}"]=True; p[f"end_time_{i}"]=p.get(f"pause_started_{i}") or now; p[f"paused_{i}"]=False; p[f"pause_started_{i}"]=None; _append_payload_event(p,i,"Experiment ended","Ended from experiment management",now)
-        payloads[i]=p
-    _bulk_update_subject_payloads(exp_id,payloads,now,completed_at=now)
-
-def maybe_mark_experiment_complete():
-    if not all(is_ended(i) for i in range(1,mouse_count()+1)): return
-    exp_id=st.session_state.get("_active_experiment_id")
-    if exp_id:
-        now=time.time(); _db_execute("UPDATE experiments SET completed_at=COALESCE(completed_at,?),updated_at=? WHERE id=?",(now,now,exp_id))
-
-# ============================================================
-# EVENT LOG / TIMESHEETS
-# ============================================================
-
-def log_event(i,event_name,details="",when_epoch=None):
-    epoch=float(when_epoch if when_epoch is not None else time.time()); key=f"event_log_{i}"; log=list(st.session_state.get(key,[])); entry={"_id":uuid.uuid4().hex,"Event":str(event_name),"Absolute time":wall_datetime(epoch).strftime("%Y-%m-%d %H:%M:%S"),"Details":str(details or ""),"_epoch":epoch}; log.append(entry); st.session_state[key]=log; return entry
-
-def event_epoch(entry):
-    try:
-        if entry.get("_epoch") is not None: return float(entry["_epoch"])
-    except (TypeError,ValueError): pass
-    absolute=str(entry.get("Absolute time","")).strip()
-    if not absolute: return None
-    try: return datetime.strptime(absolute,"%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo(APP_TIMEZONE)).timestamp()
-    except ValueError: return None
-
-def _format_relative(seconds):
-    sign="-" if seconds<0 else "+"; seconds=abs(seconds); return sign+format_total_elapsed(seconds)
-
-def relative_time_map(i,log):
-    base=st.session_state.get(f"experiment_start_{i}")
-    epochs=[event_epoch(e) for e in log if event_epoch(e) is not None]
-    if base is None and epochs: base=min(epochs)
-    result={}
-    for order,e in enumerate(log):
-        ep=event_epoch(e); value="—" if ep is None or base is None else _format_relative(ep-float(base)); key=e.get("_id") or f"__order_{order}"; result[key]=value
-    return result
-
-def is_backtime_editable_event(entry): return entry.get("Event") in {"Anesthesia started","Anesthesia redosed","Board acclimation started","Shock started","Resuscitation started"}
-
-def backtime_start_event(i,event_id,minutes):
-    try: minutes=float(minutes)
-    except (TypeError,ValueError): return False,"Enter a valid number of minutes."
-    if minutes<=0: return False,"Back-time must be greater than 0 minutes."
-    key=f"event_log_{i}"; log=list(st.session_state.get(key,[])); idx=next((n for n,e in enumerate(log) if e.get("_id")==event_id),None)
-    if idx is None: return False,"That event could not be found."
-    entry=dict(log[idx])
-    if not is_backtime_editable_event(entry): return False,"That event is not a timer start and cannot be back-timed here."
-    old=event_epoch(entry)
-    if old is None: return False,"The saved event time could not be parsed."
-    new=old-minutes*60.0; name=entry.get("Event"); _record_global_undo(f"Back-time {name} — {subject_name(i)}",[i]); entry["_epoch"]=new; entry["Absolute time"]=wall_datetime(new).strftime("%Y-%m-%d %H:%M:%S"); log[idx]=entry; st.session_state[key]=log
-    if name=="Board acclimation started": st.session_state[f"board_start_{i}"]=new
-    elif name=="Shock started": st.session_state[f"shock_start_{i}"]=new; st.session_state[f"shock_wallclock_{i}"]=wall_datetime(new).strftime("%H:%M:%S")
-    elif name=="Resuscitation started": st.session_state[f"resus_start_{i}"]=new
-    elif name in ("Anesthesia started","Anesthesia redosed"):
-        ae=[x for x in log if x.get("Event") in ("Anesthesia started","Anesthesia redosed")]
-        if ae and ae[-1].get("_id")==event_id: st.session_state[f"anesthesia_start_{i}"]=new
-        if name=="Anesthesia started":
-            cur=st.session_state.get(f"experiment_start_{i}")
-            if cur is None or new<float(cur): st.session_state[f"experiment_start_{i}"]=new
-    log_event(i,"Time correction",f"{name} moved {minutes:g} min earlier"); persist_subject(i); clear_mouse_alerts(i); st.session_state["_needs_full_rerun"]=True; return True,None
-
-def build_all_timesheets_text():
-    """Build the complete text export using one stable subject ordering."""
-    indices = ordered_subject_indices()
-    lines=[
-        "Shock Timer - Aggregated Timesheets",
-        f"Experiment: {st.session_state.get('_active_experiment_name','')}",
-        f"Timezone: {APP_TIMEZONE}",
-        f"Exported: {wall_datetime().strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
-        "BLOOD PRESSURE SUMMARY",
-        "-"*96,
-        "Subject | Weight | Starting MAP | Ending MAP",
-    ]
+    totals = {
+        "Initial": {"doses": 0, "volume_ml": 0.0, "missing_weight": 0},
+        "Redose": {"doses": 0, "volume_ml": 0.0, "missing_weight": 0},
+    }
 
     for i in indices:
-        start=starting_map(i)
-        end=ending_map(i)
+        rows = (
+            rows_by_subject.get(i, [])
+            if rows_by_subject is not None
+            else anesthesia_summary_rows(i)
+        )
+        for row in rows:
+            stats = totals[row["type"]]
+            stats["doses"] += 1
+            if row["volume_ml"] is None:
+                stats["missing_weight"] += 1
+            else:
+                stats["volume_ml"] += float(row["volume_ml"])
+
+    return totals
+
+def _format_anesthesia_usage_lines(usage):
+    """Return aligned initial-dose and redose vial totals for text export."""
+    rows=[
+        ("Initial dose",usage["Initial"]),
+        ("Redose",usage["Redose"]),
+    ]
+
+    dose_texts=[]
+    for _,stats in rows:
+        dose_word="dose" if stats["doses"]==1 else "doses"
+        dose_texts.append(f"{stats['doses']} {dose_word}")
+
+    label_width=max(len(label) for label,_ in rows)
+    dose_width=max(len(value) for value in dose_texts)
+
+    lines=[]
+    for (label,stats),dose_text in zip(rows,dose_texts):
+        line=(
+            f"{label:<{label_width}} | "
+            f"{dose_text:<{dose_width}} | "
+            f"{stats['volume_ml']:.1f} mL total"
+        )
+        if stats["missing_weight"]:
+            missing_word="dose" if stats["missing_weight"]==1 else "doses"
+            line += f" | {stats['missing_weight']} {missing_word} missing weight"
+        lines.append(line)
+
+    return lines
+
+
+
+
+
+def _anesthesia_export_rows(indices, rows_by_subject):
+    rows = []
+    for i in indices:
+        for row in rows_by_subject[i]:
+            rows.append({
+                "subject": subject_name(i),
+                "dose": str(row["dose"]),
+                "type": str(row["type"]),
+                "relative": str(row["relative"]),
+                "absolute": str(row["absolute"]),
+                "weight": str(row["weight"]),
+                "volume": str(row["volume"]),
+            })
+    return rows
+
+
+def _anesthesia_export_lines(indices, rows_by_subject):
+    export_rows = _anesthesia_export_rows(indices, rows_by_subject)
+    if not export_rows:
+        return ["-" * 96, "No anesthesia administrations recorded."]
+
+    headers = {
+        "subject": "Subj",
+        "dose": "#",
+        "type": "Type",
+        "relative": "Rel time",
+        "absolute": "Abs time",
+        "weight": "Wt",
+        "volume": "Vol",
+    }
+    fields = tuple(headers)
+    widths = {
+        field: max(
+            len(headers[field]),
+            max(len(row[field]) for row in export_rows),
+        )
+        for field in fields
+    }
+
+    def table_line(values):
+        return (
+            f"{values['subject']:<{widths['subject']}} | "
+            f"{values['dose']:>{widths['dose']}} | "
+            f"{values['type']:<{widths['type']}} | "
+            f"{values['relative']:<{widths['relative']}} | "
+            f"{values['absolute']:<{widths['absolute']}} | "
+            f"{values['weight']:>{widths['weight']}} | "
+            f"{values['volume']:>{widths['volume']}}"
+        )
+
+    header_line = table_line(headers)
+    lines = ["-" * len(header_line), header_line, "-" * len(header_line)]
+    lines.extend(table_line(row) for row in export_rows)
+
+    usage = anesthesia_usage_totals(indices, rows_by_subject)
+    lines.extend([
+        "",
+        "ANESTHESIA USE TOTALS (0.01 mL/g per administration)",
+        *_format_anesthesia_usage_lines(usage),
+    ])
+    return lines
+
+
+def _blood_pressure_export_lines(indices):
+    lines = [
+        "",
+        "BLOOD PRESSURE SUMMARY",
+        "-" * 96,
+        "Subject | Weight | Starting MAP | Ending MAP",
+    ]
+    for i in indices:
+        start = starting_map(i)
+        end = ending_map(i)
         lines.append(
             f"{subject_name(i)} | {weight_label(i)} | "
             f"{'—' if start is None else f'{start:g} mmHg'} | "
             f"{'—' if end is None else f'{end:g} mmHg'}"
         )
+    return lines
 
-    lines += [
+
+def _volume_export_lines(indices):
+    lines = [
         "",
-        "ANESTHESIA SUMMARY",
-        "-"*96,
-        "Subject | Dose | Type | Relative time | Absolute time | Weight",
+        "VOLUME SUMMARY",
+        "-" * 96,
+        "Subject | Shock volume removed | Resuscitation volume given",
+    ]
+    for i in indices:
+        shock_vol = shock_volume(i)
+        resus_vol = resuscitation_volume(i)
+        lines.append(
+            f"{subject_name(i)} | "
+            f"{'—' if shock_vol is None else f'{shock_vol:g} mL'} | "
+            f"{'—' if resus_vol is None else f'{resus_vol:g} mL'}"
+        )
+    return lines
+
+
+def _subject_timesheet_export_lines(i):
+    lines = [
+        "=" * 96,
+        f"{subject_name(i)} (Mouse {i}; {weight_label(i)})",
+        "=" * 96,
     ]
 
-    any_anesthesia=False
+    map_summary = _map_summary(i)
+    if map_summary:
+        lines.append(map_summary)
+
+    volume_summary = _volume_summary(i)
+    if volume_summary:
+        lines.append(volume_summary)
+
+    log = list(st.session_state.get(f"event_log_{i}", []))
+    relative_times = relative_time_map(i, log)
+    if not log:
+        lines.append("No events recorded.")
+    else:
+        lines.extend([
+            "Relative time | Absolute time        | Event | Details",
+            "-" * 96,
+        ])
+
+    for order, event in enumerate(log):
+        relative = relative_times.get(
+            event.get("_id"),
+            relative_times.get(f"__order_{order}", "—"),
+        )
+        line = (
+            f"{relative:>13} | "
+            f"{event.get('Absolute time', '')} | "
+            f"{event.get('Event', '')}"
+        )
+        details = str(event.get("Details", "")).strip()
+        lines.append(line + (f" | {details}" if details else ""))
+
+    lines.append("")
+    return lines
+
+
+def build_all_timesheets_text():
+    """Build the complete text export using one stable subject ordering."""
+    indices = ordered_subject_indices()
+    anesthesia_rows_by_subject = {
+        i: anesthesia_summary_rows(i)
+        for i in indices
+    }
+
+    lines = [
+        "Shock Timer - Aggregated Timesheets",
+        f"Experiment: {st.session_state.get('_active_experiment_name', '')}",
+        f"Timezone: {APP_TIMEZONE}",
+        f"Exported: {wall_datetime().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "ANESTHESIA SUMMARY",
+    ]
+    lines.extend(_anesthesia_export_lines(indices, anesthesia_rows_by_subject))
+    lines.extend(_blood_pressure_export_lines(indices))
+    lines.extend(_volume_export_lines(indices))
+    lines.extend(["", "DETAILED SUBJECT TIMESHEETS", ""])
     for i in indices:
-        for row in anesthesia_summary_rows(i):
-            any_anesthesia=True
-            lines.append(
-                f"{subject_name(i)} | {row['dose']} | {row['type']} | "
-                f"{row['relative']} | {row['absolute']} | {row['weight']}"
-            )
-    if not any_anesthesia:
-        lines.append("No anesthesia administrations recorded.")
+        lines.extend(_subject_timesheet_export_lines(i))
 
-    lines += ["", "DETAILED SUBJECT TIMESHEETS", ""]
-
-    for i in indices:
-        lines += ["="*96,f"{subject_name(i)} (Mouse {i}; {weight_label(i)})","="*96]
-        map_summary=_map_summary(i)
-        if map_summary:
-            lines.append(map_summary)
-
-        log=list(st.session_state.get(f"event_log_{i}",[]))
-        rel=relative_time_map(i,log)
-
-        if not log:
-            lines.append("No events recorded.")
-        else:
-            lines += ["Relative time | Absolute time        | Event | Details","-"*96]
-
-        for order,e in enumerate(log):
-            r=rel.get(e.get("_id"),rel.get(f"__order_{order}","—"))
-            line=f"{r:>13} | {e.get('Absolute time','')} | {e.get('Event','')}"
-            details=str(e.get("Details","")).strip()
-            lines.append(line+(f" | {details}" if details else ""))
-
-        lines.append("")
-    return "\n".join(lines).rstrip()+"\n"
-
-    return "\n".join(lines).rstrip()+"\n"
+    return "\n".join(lines).rstrip() + "\n"
 
 # ============================================================
 # ALERT / TIMER CORE / UNDO
@@ -2466,7 +2801,9 @@ def undo_last_stage_action(i):
     _record_global_undo(f"Undo {_undo_label(action)} — {subject_name(i)}",[i]); h.pop()
     if action=="anesthesia_redose":
         s=item.get("snapshot") or {}; st.session_state[f"anesthesia_start_{i}"]=s.get("anesthesia_start"); st.session_state[f"anesthesia_due_override_{i}"]=s.get("anesthesia_due_override"); st.session_state[f"anesthesia_dose_count_{i}"]=int(s.get("anesthesia_dose_count",1))
-    elif action=="start_resus": st.session_state[f"resus_start_{i}"]=None
+    elif action=="start_resus":
+        st.session_state[f"resus_start_{i}"]=None
+        st.session_state[f"shock_volume_ml_{i}"]=None
     elif action=="start_shock":
         st.session_state[f"shock_start_{i}"]=None; st.session_state[f"shock_wallclock_{i}"]=None; st.session_state[f"starting_map_mmhg_{i}"]=None
     elif action=="start_board": st.session_state[f"board_start_{i}"]=None
@@ -2526,8 +2863,19 @@ def start_shock(i,force=False):
 def start_resuscitation(i,force=False):
     if not mouse_is_running(i): return
     now=time.time()
+    if starting_map(i) is None:
+        request_dialog(i,"starting_map")
+        return
     if st.session_state.get(f"resus_start_{i}") is not None or st.session_state.get(f"shock_start_{i}") is None or (not force and not shock_is_complete(i,now)): return
-    _record_global_undo(f"{'Force start resus' if force else 'Start resus'} — {subject_name(i)}",[i]); st.session_state[f"resus_start_{i}"]=now; event=log_event(i,"Resuscitation started","Forced advance before shock completed" if force else "",when_epoch=now); _push_undo(i,"start_resus",event); clear_alert(i,"Resuscitation"); persist_subject(i)
+    _record_global_undo(f"{'Force start resus' if force else 'Start resus'} — {subject_name(i)}",[i])
+    st.session_state[f"resus_start_{i}"]=now
+    st.session_state[f"shock_volume_ml_{i}"]=None
+    event=log_event(i,"Resuscitation started","Forced advance before shock completed" if force else "",when_epoch=now)
+    _push_undo(i,"start_resus",event)
+    clear_alert(i,"Resuscitation")
+    persist_subject(i)
+    st.session_state["_pending_dialog"]={"mouse":int(i),"kind":"shock_volume"}
+    st.session_state["_needs_full_rerun"]=True
 
 def toggle_pause(i):
     if is_ended(i): return
@@ -2536,43 +2884,154 @@ def toggle_pause(i):
         st.session_state[f"paused_{i}"]=True; st.session_state[f"pause_started_{i}"]=now; log_event(i,"Paused",when_epoch=now)
     else:
         started=st.session_state.get(f"pause_started_{i}") or now; delta=max(0,now-float(started))
-        for field in ("experiment_start","anesthesia_start","board_start","shock_start","resus_start","anesthesia_due_override"):
+        for field in PAUSE_SHIFT_FIELDS:
             key=f"{field}_{i}"; value=st.session_state.get(key)
             if value is not None: st.session_state[key]=float(value)+delta
         st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; log_event(i,"Resumed",f"Paused {format_timer(delta)}",when_epoch=now)
     clear_mouse_alerts(i); persist_subject(i)
 
-def end_mouse(i,forced=False,ending_map_mmhg=None):
+def end_mouse(i,forced=False,ending_map_mmhg=None,resuscitation_volume_ml=None):
     if is_ended(i): return False
-    # If the subject has entered resuscitation, an ending MAP is required
-    # before the subject can be marked ended/completed.
-    if st.session_state.get(f"resus_start_{i}") is not None and ending_map_mmhg is None:
+    if st.session_state.get(f"shock_start_{i}") is not None and starting_map(i) is None:
         return False
-    now=time.time(); _record_global_undo(f"{'Force end subject' if forced else 'End subject'} — {subject_name(i)}",[i]); end_at=st.session_state.get(f"pause_started_{i}") or now
+    # Once resuscitation has started, shock volume and both ending measurements
+    # are required before the subject can be marked ended.
+    if st.session_state.get(f"resus_start_{i}") is not None:
+        if (
+            shock_volume(i) is None
+            or ending_map_mmhg is None
+            or resuscitation_volume_ml is None
+        ):
+            return False
+    now=time.time()
+    _record_global_undo(f"{'Force end subject' if forced else 'End subject'} — {subject_name(i)}",[i])
+    end_at=st.session_state.get(f"pause_started_{i}") or now
     if ending_map_mmhg is not None:
         st.session_state[f"ending_map_mmhg_{i}"]=float(ending_map_mmhg)
         log_event(i,"Ending MAP",f"{float(ending_map_mmhg):g} mmHg",when_epoch=now)
-    st.session_state[f"ended_{i}"]=True; st.session_state[f"end_time_{i}"]=end_at; st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; clear_mouse_alerts(i); log_event(i,"Experiment ended","Forced advance before resuscitation completed" if forced else "",when_epoch=now); persist_subject(i); maybe_mark_experiment_complete(); return True
+    if resuscitation_volume_ml is not None:
+        st.session_state[f"resuscitation_volume_ml_{i}"]=float(resuscitation_volume_ml)
+        log_event(i,"Resuscitation volume",f"{float(resuscitation_volume_ml):g} mL given",when_epoch=now)
+    st.session_state[f"ended_{i}"]=True
+    st.session_state[f"end_time_{i}"]=end_at
+    st.session_state[f"paused_{i}"]=False
+    st.session_state[f"pause_started_{i}"]=None
+    clear_mouse_alerts(i)
+    log_event(i,"Experiment ended","Forced advance before resuscitation completed" if forced else "",when_epoch=now)
+    persist_subject(i)
+    maybe_mark_experiment_complete()
+    return True
 
 def reset_mouse(i):
-    _record_global_undo(f"Reset subject — {subject_name(i)}",[i]); name=subject_name(i); weight=mouse_weight(i); order=st.session_state.get(f"display_order_{i}",i); init=st.session_state.get(f"anesthesia_initial_duration_{i}",DEFAULT_INITIAL_ANESTHESIA); sub=st.session_state.get(f"anesthesia_duration_{i}",DEFAULT_SUBSEQUENT_ANESTHESIA); delay=st.session_state.get(f"anesthesia_delay_duration_{i}",DEFAULT_ANESTHESIA_DELAY); snd=st.session_state.get(f"notification_sound_{i}",DEFAULT_NOTIFICATION_SOUND); enabled=st.session_state.get(f"notification_sound_enabled_{i}",DEFAULT_NOTIFICATION_SOUND_ENABLED)
-    for k,v in mouse_defaults(i).items(): st.session_state[k]=_copy_value(v)
-    st.session_state[f"subject_name_{i}"]=name; st.session_state[f"mouse_weight_g_{i}"]=weight; st.session_state[f"display_order_{i}"]=order; st.session_state[f"anesthesia_initial_duration_{i}"]=init; st.session_state[f"anesthesia_duration_{i}"]=sub; st.session_state[f"anesthesia_delay_duration_{i}"]=delay; st.session_state[f"notification_sound_{i}"]=snd; st.session_state[f"notification_sound_enabled_{i}"]=enabled; clear_mouse_alerts(i); persist_subject(i); _sync_experiment_completion_from_session()
+    _record_global_undo(f"Reset subject — {subject_name(i)}", [i])
 
-def end_all_subjects_current_experiment(ending_maps=None):
+    preserved = {
+        "subject_name": subject_name(i),
+        "mouse_weight_g": mouse_weight(i),
+        "display_order": st.session_state.get(f"display_order_{i}", i),
+        "anesthesia_initial_duration": st.session_state.get(
+            f"anesthesia_initial_duration_{i}", DEFAULT_INITIAL_ANESTHESIA
+        ),
+        "anesthesia_duration": st.session_state.get(
+            f"anesthesia_duration_{i}", DEFAULT_SUBSEQUENT_ANESTHESIA
+        ),
+        "anesthesia_delay_duration": st.session_state.get(
+            f"anesthesia_delay_duration_{i}", DEFAULT_ANESTHESIA_DELAY
+        ),
+        "notification_sound": st.session_state.get(
+            f"notification_sound_{i}", DEFAULT_NOTIFICATION_SOUND
+        ),
+        "notification_sound_enabled": st.session_state.get(
+            f"notification_sound_enabled_{i}", DEFAULT_NOTIFICATION_SOUND_ENABLED
+        ),
+    }
+
+    for key, value in mouse_defaults(i).items():
+        st.session_state[key] = _copy_value(value)
+    for field, value in preserved.items():
+        st.session_state[f"{field}_{i}"] = value
+
+    clear_mouse_alerts(i)
+    persist_subject(i)
+    _sync_experiment_completion_from_session()
+
+def end_all_subjects_current_experiment(
+    ending_maps=None,
+    resuscitation_volumes=None,
+    starting_maps=None,
+    shock_volumes=None,
+):
     targets=[i for i in ordered_subject_indices() if not is_ended(i)]
-    if not targets: return True
+    if not targets:
+        return True
+
     ending_maps={int(k):float(v) for k,v in (ending_maps or {}).items()}
-    _record_global_undo("End all subjects",targets); now=time.time()
+    resuscitation_volumes={
+        int(k):float(v) for k,v in (resuscitation_volumes or {}).items()
+    }
+    starting_maps={int(k):float(v) for k,v in (starting_maps or {}).items()}
+    shock_volumes={int(k):float(v) for k,v in (shock_volumes or {}).items()}
+
+    _record_global_undo("End all subjects",targets)
+    now=time.time()
+
     for i in targets:
+        if i in starting_maps:
+            st.session_state[f"starting_map_mmhg_{i}"]=starting_maps[i]
+            shock_time=st.session_state.get(f"shock_start_{i}") or now
+            log_event(
+                i,
+                "Starting MAP",
+                f"{starting_maps[i]:g} mmHg",
+                when_epoch=shock_time,
+            )
+
+        if i in shock_volumes:
+            st.session_state[f"shock_volume_ml_{i}"]=shock_volumes[i]
+            resus_time=st.session_state.get(f"resus_start_{i}") or now
+            log_event(
+                i,
+                "Shock volume",
+                f"{shock_volumes[i]:g} mL removed",
+                when_epoch=resus_time,
+            )
+
         if i in ending_maps:
             st.session_state[f"ending_map_mmhg_{i}"]=ending_maps[i]
             log_event(i,"Ending MAP",f"{ending_maps[i]:g} mmHg",when_epoch=now)
-        st.session_state[f"ended_{i}"]=True; st.session_state[f"end_time_{i}"]=st.session_state.get(f"pause_started_{i}") or now; st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; clear_mouse_alerts(i); log_event(i,"Experiment ended","Ended with End all subjects",when_epoch=now)
+
+        if i in resuscitation_volumes:
+            st.session_state[f"resuscitation_volume_ml_{i}"]=resuscitation_volumes[i]
+            log_event(
+                i,
+                "Resuscitation volume",
+                f"{resuscitation_volumes[i]:g} mL given",
+                when_epoch=now,
+            )
+
+        st.session_state[f"ended_{i}"]=True
+        st.session_state[f"end_time_{i}"]=(
+            st.session_state.get(f"pause_started_{i}") or now
+        )
+        st.session_state[f"paused_{i}"]=False
+        st.session_state[f"pause_started_{i}"]=None
+        clear_mouse_alerts(i)
+        log_event(
+            i,
+            "Experiment ended",
+            "Ended with End all subjects",
+            when_epoch=now,
+        )
+
     ok=persist_subjects(targets)
     if ok:
         exp_id=st.session_state.get("_active_experiment_id")
-        if exp_id: _db_execute("UPDATE experiments SET completed_at=COALESCE(completed_at,?),updated_at=? WHERE id=?",(now,now,exp_id))
+        if exp_id:
+            _db_execute(
+                "UPDATE experiments SET completed_at=COALESCE(completed_at,?),"
+                "updated_at=? WHERE id=?",
+                (now,now,exp_id),
+            )
     return ok
 
 # ============================================================
@@ -2594,13 +3053,154 @@ def validate_mouse_name_weight(name,weight,default_name="Mouse"):
 
 def queue_weight_warning(context,entries,**extra): st.session_state["_pending_weight_warning"]={"context":context,"entries":entries,**extra}
 
-def save_subject_profile(i,name,weight):
+
+def _edit_subject_widget_keys(i):
+    return [
+        f"edit_name_{i}",
+        f"edit_weight_{i}",
+        f"edit_starting_map_{i}",
+        f"edit_shock_volume_{i}",
+        f"edit_ending_map_{i}",
+        f"edit_resuscitation_volume_{i}",
+    ]
+
+def _clear_edit_subject_widgets(i):
+    for key in _edit_subject_widget_keys(i):
+        st.session_state.pop(key,None)
+
+def _format_corrected_value(value,unit):
+    if value is None:
+        return "—"
+    return f"{float(value):g} {unit}"
+
+def edit_subject_field_availability(i,now=None):
+    """
+    Return which correction fields have been reached by this subject's workflow.
+
+    Name and weight are always editable.
+    Starting MAP unlocks when shock starts.
+    Shock volume unlocks when resuscitation starts.
+    Ending MAP and resuscitation volume unlock when the resuscitation endpoint
+    is reached, or when a subject is force-ended after resuscitation has begun.
+    Existing recorded values also keep their corresponding field available so
+    legacy/corrected data can always be repaired.
+    """
+    wall_now=time.time() if now is None else float(now)
+    effective=effective_now(i,wall_now)
+
+    shock_started=st.session_state.get(f"shock_start_{i}") is not None
+    resus_started=st.session_state.get(f"resus_start_{i}") is not None
+
+    starting_map_reached=shock_started or starting_map(i) is not None
+    shock_volume_reached=resus_started or shock_volume(i) is not None
+
+    resus_endpoint_reached=(
+        resus_started
+        and (
+            is_ended(i)
+            or resus_is_complete(i,effective)
+        )
+    )
+    ending_measurements_reached=(
+        resus_endpoint_reached
+        or ending_map(i) is not None
+        or resuscitation_volume(i) is not None
+    )
+
+    return {
+        "name":True,
+        "weight":True,
+        "starting_map":starting_map_reached,
+        "shock_volume":shock_volume_reached,
+        "ending_map":ending_measurements_reached,
+        "resuscitation_volume":ending_measurements_reached,
+    }
+
+def save_subject_data_edits(
+    i,
+    name,
+    weight,
+    starting_map_mmhg,
+    shock_volume_ml,
+    ending_map_mmhg,
+    resuscitation_volume_ml,
+):
+    """Persist corrected subject-entry fields without requiring an active timer."""
     name=(name or "").strip()
-    if not name: return False,"Subject name cannot be blank."
-    try: weight=float(weight)
-    except (TypeError,ValueError): return False,"Enter a valid weight."
-    if weight<=0: return False,"Weight must be greater than 0 g."
-    st.session_state[f"subject_name_{i}"]=name; st.session_state[f"mouse_weight_g_{i}"]=round(weight,1); persist_subject(i); return True,None
+    if not name:
+        return False,"Subject name cannot be blank.",False
+    try:
+        weight=round(float(weight),1)
+    except (TypeError,ValueError):
+        return False,"Enter a valid weight.",False
+    if weight<=0:
+        return False,"Weight must be greater than 0 g.",False
+
+    old_name=subject_name(i)
+    old_weight=mouse_weight(i)
+    old_start=starting_map(i)
+    old_shock=shock_volume(i)
+    old_end=ending_map(i)
+    old_resus=resuscitation_volume(i)
+
+    changes=[]
+    if old_name!=name:
+        changes.append(f'Name "{old_name}" → "{name}"')
+    if old_weight!=weight:
+        changes.append(
+            f"Weight {_format_corrected_value(old_weight,'g')} → "
+            f"{_format_corrected_value(weight,'g')}"
+        )
+    if old_start!=starting_map_mmhg:
+        changes.append(
+            f"Starting MAP {_format_corrected_value(old_start,'mmHg')} → "
+            f"{_format_corrected_value(starting_map_mmhg,'mmHg')}"
+        )
+    if old_shock!=shock_volume_ml:
+        changes.append(
+            f"Shock volume {_format_corrected_value(old_shock,'mL')} → "
+            f"{_format_corrected_value(shock_volume_ml,'mL')}"
+        )
+    if old_end!=ending_map_mmhg:
+        changes.append(
+            f"Ending MAP {_format_corrected_value(old_end,'mmHg')} → "
+            f"{_format_corrected_value(ending_map_mmhg,'mmHg')}"
+        )
+    if old_resus!=resuscitation_volume_ml:
+        changes.append(
+            f"Resuscitation volume {_format_corrected_value(old_resus,'mL')} → "
+            f"{_format_corrected_value(resuscitation_volume_ml,'mL')}"
+        )
+
+    if not changes:
+        return True,None,False
+
+    # Keep corrections undoable while retaining an audit trail in the timesheet.
+    _record_global_undo(f"Edit subject data — {old_name}",[i])
+    st.session_state[f"subject_name_{i}"]=name
+    st.session_state[f"mouse_weight_g_{i}"]=weight
+    st.session_state[f"starting_map_mmhg_{i}"]=starting_map_mmhg
+    st.session_state[f"shock_volume_ml_{i}"]=shock_volume_ml
+    st.session_state[f"ending_map_mmhg_{i}"]=ending_map_mmhg
+    st.session_state[f"resuscitation_volume_ml_{i}"]=resuscitation_volume_ml
+
+    # Anesthesia volumes are calculated from the recorded subject weight.
+    # If that weight is corrected, update prior anesthesia event snapshots so
+    # the per-dose and vial-total calculations use the corrected value.
+    if old_weight!=weight:
+        event_key=f"event_log_{i}"
+        corrected_log=[]
+        for event in st.session_state.get(event_key,[]):
+            corrected=dict(event)
+            if corrected.get("Event") in ANESTHESIA_EVENT_NAMES:
+                corrected["_weight_g"]=weight
+                corrected["Details"]=f"Weight {weight:.1f} g"
+            corrected_log.append(corrected)
+        st.session_state[event_key]=corrected_log
+
+    log_event(i,"Subject data edited","; ".join(changes))
+    persist_subject(i)
+    return True,None,True
 
 def create_mouse_subject(name,weight):
     exp_id=st.session_state.get("_active_experiment_id")
@@ -2640,8 +3240,20 @@ def move_subject(i,direction):
 
 def _clear_configuration():
     for key in list(st.session_state):
-        if key.startswith("_cfg_name_") or key.startswith("_cfg_weight_"): st.session_state.pop(key,None)
-    for key in ("_configuration_draft","_configuration_experiment_name","_show_configuration_dialog","_configuration_error"): st.session_state.pop(key,None)
+        if (
+            key.startswith("_cfg_name_")
+            or key.startswith("_cfg_weight_")
+            or key.startswith("_preflight_")
+        ):
+            st.session_state.pop(key,None)
+    for key in (
+        "_configuration_draft",
+        "_configuration_experiment_name",
+        "_show_configuration_dialog",
+        "_configuration_error",
+        "_pending_run_preflight",
+    ):
+        st.session_state.pop(key,None)
 
 def _new_draft_mouse(number): return {"draft_id":uuid.uuid4().hex,"name":f"Mouse {number}","weight_g":_default_entry_weight()}
 
@@ -2657,6 +3269,110 @@ def _sync_cfg_from_widgets():
     for row in draft:
         did=row["draft_id"]; updated.append({"draft_id":did,"name":str(st.session_state.get(f"_cfg_name_{did}",row.get("name",""))),"weight_g":float(st.session_state.get(f"_cfg_weight_{did}",row.get("weight_g",0.0)) or 0.0)})
     st.session_state["_configuration_draft"]=updated; return updated
+
+def queue_run_preflight(mode,**payload):
+    st.session_state["_pending_run_preflight"]={"mode":str(mode),**payload}
+    st.session_state["_preflight_audio_tested"]=False
+    st.session_state["_preflight_audio_confirmed"]=False
+    st.session_state["_preflight_awake_confirmed"]=False
+
+def _clear_run_preflight():
+    st.session_state.pop("_pending_run_preflight",None)
+    for key in (
+        "_preflight_audio_tested",
+        "_preflight_audio_confirmed",
+        "_preflight_awake_confirmed",
+    ):
+        st.session_state.pop(key,None)
+
+@st.dialog("Run preflight")
+def run_preflight_dialog():
+    payload=st.session_state.get("_pending_run_preflight") or {}
+    mode=str(payload.get("mode",""))
+    if not mode:
+        return
+
+    st.markdown("### Preflight check")
+    st.caption(
+        "Confirm storage, alert audio, and screen-wake readiness before "
+        "starting or resuming live timers."
+    )
+
+    storage_ok,storage_message=storage_preflight_check()
+    if storage_ok:
+        st.success(f"Storage ✓  {storage_message}")
+    else:
+        st.error(f"Storage ✕  {storage_message}")
+
+    # Browser helper fills this with live capability information.
+    st.html(
+        '<div class="preflight-browser-status" '
+        'data-lab-preflight-browser-status>'
+        'Checking browser audio and screen-wake support…</div>'
+    )
+
+    if st.button(
+        "🔊 Play test alert",
+        key="preflight_test_audio",
+        use_container_width=True,
+    ):
+        st.session_state["_preflight_audio_tested"]=True
+        render_hidden_autoplay_audio(
+            DEFAULT_NOTIFICATION_SOUND,
+            "preflight_test",
+        )
+
+    audio_tested=bool(st.session_state.get("_preflight_audio_tested",False))
+    st.checkbox(
+        "I heard the test alert",
+        key="_preflight_audio_confirmed",
+        disabled=not audio_tested,
+    )
+    st.checkbox(
+        "Keep the screen awake during the run. Use automatic Wake Lock when "
+        "supported; otherwise I will prevent sleep manually.",
+        key="_preflight_awake_confirmed",
+    )
+
+    ready=(
+        storage_ok
+        and bool(st.session_state.get("_preflight_audio_confirmed",False))
+        and bool(st.session_state.get("_preflight_awake_confirmed",False))
+    )
+
+    left,right=st.columns(2)
+    with left:
+        if st.button("Cancel",key="preflight_cancel",use_container_width=True):
+            _clear_run_preflight()
+            st.rerun()
+
+    with right:
+        label="Start experiment" if mode=="create" else "Resume experiment"
+        if st.button(
+            label,
+            key="preflight_continue",
+            use_container_width=True,
+            type="primary",
+            disabled=not ready,
+        ):
+            try:
+                if mode=="create":
+                    configured=list(payload.get("configured") or [])
+                    exp_name=str(payload.get("name") or "Experiment")
+                    exp_id=create_experiment_record(exp_name,configured)
+                    _clear_run_preflight()
+                    _clear_configuration()
+                    load_experiment_into_session(exp_id)
+                    st.rerun()
+
+                if mode=="resume":
+                    exp_id=str(payload.get("exp_id") or "")
+                    _clear_run_preflight()
+                    if load_experiment_into_session(exp_id):
+                        st.rerun()
+                    st.error("Experiment could not be loaded.")
+            except Exception as exc:
+                st.error(f"Preflight launch failed: {exc}")
 
 @st.dialog("Configure experiment",width="large")
 def configure_experiment_dialog():
@@ -2751,13 +3467,12 @@ def configure_experiment_dialog():
                 if atypical:
                     queue_weight_warning("configuration",configured)
                     st.rerun()
-                try:
-                    exp_id=create_experiment_record(name,configured)
-                    _clear_configuration()
-                    load_experiment_into_session(exp_id)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not create experiment: {exc}")
+                queue_run_preflight(
+                    "create",
+                    name=name,
+                    configured=configured,
+                )
+                st.rerun()
 
 
 @st.dialog("Confirm mouse weight")
@@ -2772,16 +3487,38 @@ def weight_warning_dialog():
         if st.button("Use these weights",key="weight_warning_accept",use_container_width=True,type="primary"):
             context=payload.get("context")
             if context=="configuration":
-                try:
-                    exp_id=create_experiment_record(st.session_state.get("_configuration_experiment_name","Experiment"),entries); st.session_state.pop("_pending_weight_warning",None); _clear_configuration(); load_experiment_into_session(exp_id); st.rerun()
-                except Exception as exc: st.error(str(exc))
+                st.session_state.pop("_pending_weight_warning",None)
+                queue_run_preflight(
+                    "create",
+                    name=st.session_state.get(
+                        "_configuration_experiment_name",
+                        "Experiment",
+                    ),
+                    configured=entries,
+                )
+                st.rerun()
             elif context=="add_mouse":
                 e=entries[0] if entries else {}; ok,error=create_mouse_subject(e.get("name"),e.get("weight_g"))
                 if ok: st.session_state.pop("_pending_weight_warning",None); st.session_state.pop("_add_mouse_name",None); st.session_state.pop("_add_mouse_weight",None); st.rerun()
                 st.warning(error)
             elif context=="edit_subject":
-                e=entries[0] if entries else {}; i=int(payload.get("mouse",0)); ok,error=save_subject_profile(i,e.get("name"),e.get("weight_g"))
-                if ok: st.session_state.pop("_pending_weight_warning",None); st.session_state.pop(f"edit_name_{i}",None); st.session_state.pop(f"edit_weight_{i}",None); st.rerun()
+                e=entries[0] if entries else {}
+                i=int(payload.get("mouse",0))
+                edits=dict(payload.get("edits") or {})
+                ok,error,changed=save_subject_data_edits(
+                    i,
+                    e.get("name"),
+                    e.get("weight_g"),
+                    edits.get("starting_map_mmhg"),
+                    edits.get("shock_volume_ml"),
+                    edits.get("ending_map_mmhg"),
+                    edits.get("resuscitation_volume_ml"),
+                )
+                if ok:
+                    st.session_state.pop("_pending_weight_warning",None)
+                    _clear_edit_subject_widgets(i)
+                    st.toast("Subject data updated" if changed else "No subject data changes")
+                    st.rerun()
                 st.warning(error)
 
 def _fmt_epoch(epoch):
@@ -2845,9 +3582,17 @@ def _render_experiment_card(exp,completed):
                 key=f"open_exp_{exp_id}",
                 use_container_width=True,
             ):
-                if load_experiment_into_session(exp_id):
+                if completed:
+                    if load_experiment_into_session(exp_id):
+                        st.rerun()
+                    st.error("Experiment could not be loaded.")
+                else:
+                    queue_run_preflight(
+                        "resume",
+                        exp_id=exp_id,
+                        name=name,
+                    )
                     st.rerun()
-                st.error("Experiment could not be loaded.")
 
         with cols[2]:
             if st.button(
@@ -2985,96 +3730,486 @@ def render_experiment_home():
 
     if st.session_state.get("_pending_weight_warning"):
         weight_warning_dialog()
+    elif st.session_state.get("_pending_run_preflight"):
+        run_preflight_dialog()
     elif st.session_state.get("_show_configuration_dialog"):
         configure_experiment_dialog()
 
-def return_to_experiment_home(): retry_unsaved_subjects(); st.session_state.clear(); st.rerun()
+def return_to_experiment_home():
+    """
+    Never discard the active in-memory record while persistent writes are
+    unconfirmed. A failed retry opens the protected exit dialog instead.
+    """
+    if retry_unsaved_subjects():
+        st.session_state.clear()
+        st.rerun()
+        return
+
+    st.session_state["_show_storage_exit_dialog"]=True
+    st.rerun()
 
 # ============================================================
 # ACTIVE EXPERIMENT DIALOGS
 # ============================================================
 
-@st.dialog("Timesheet",width="large")
-def timesheet_dialog(i):
-    st.markdown(f"### {html.escape(subject_name(i))} timesheet",unsafe_allow_html=True)
+def _render_timesheet_measurement_summary(i):
+    summary_items = [
+        ("Starting MAP", "—" if starting_map(i) is None else f"{starting_map(i):g} mmHg"),
+        ("Ending MAP", "—" if ending_map(i) is None else f"{ending_map(i):g} mmHg"),
+        ("Shock volume", "—" if shock_volume(i) is None else f"{shock_volume(i):g} mL"),
+        (
+            "Resuscitation volume",
+            "—" if resuscitation_volume(i) is None else f"{resuscitation_volume(i):g} mL",
+        ),
+    ]
+    summary_html = "".join(
+        '<div class="ts-summary-card">'
+        f'<div class="ts-summary-label">{html.escape(label)}</div>'
+        f'<div class="ts-summary-value">{html.escape(value)}</div>'
+        "</div>"
+        for label, value in summary_items
+    )
+    st.markdown(
+        f'<div class="ts-summary-grid">{summary_html}</div>',
+        unsafe_allow_html=True,
+    )
 
-    start=starting_map(i)
-    end=ending_map(i)
-    bp_left,bp_right=st.columns(2)
-    with bp_left:
-        st.caption("Starting MAP")
-        st.markdown(f"**{'—' if start is None else f'{start:g} mmHg'}**")
-    with bp_right:
-        st.caption("Ending MAP")
-        st.markdown(f"**{'—' if end is None else f'{end:g} mmHg'}**")
 
-    anesthesia_rows=anesthesia_summary_rows(i)
-    if anesthesia_rows:
-        st.markdown("**Anesthesia summary**")
-        ah=st.columns([.55,.85,1.05,1.65,.80],gap="small")
-        for c,label in zip(ah,["Dose","Type","Relative","Absolute time","Weight"]):
-            with c:
-                st.markdown(f'<div class="lab-table-header">{label}</div>',unsafe_allow_html=True)
-        for row_data in anesthesia_rows:
-            ar=st.columns([.55,.85,1.05,1.65,.80],gap="small")
-            with ar[0]: st.caption(str(row_data["dose"]))
-            with ar[1]: st.caption(row_data["type"])
-            with ar[2]: st.caption(row_data["relative"])
-            with ar[3]: st.caption(row_data["absolute"])
-            with ar[4]: st.caption(row_data["weight"])
+def _render_timesheet_anesthesia_summary(i):
+    rows = anesthesia_summary_rows(i)
+    if not rows:
+        return
 
-    st.divider()
-    st.caption(f"{weight_label(i)} · {APP_TIMEZONE} · Start events can be back-timed when a button was clicked late.")
-    log=list(st.session_state.get(f"event_log_{i}",[]))
-    if not log: st.info("No events have been recorded.")
-    else:
-        rel=relative_time_map(i,log); hdr=st.columns([1.85,1.05,1.70,2.35,.85],gap="small")
-        for c,label in zip(hdr,["Event","Relative time","Absolute time","Details","Adjust"]):
-            with c: st.markdown(f'<div class="lab-table-header">{label}</div>',unsafe_allow_html=True)
-        for order,e in enumerate(log):
-            row=st.columns([1.85,1.05,1.70,2.35,.85],gap="small",vertical_alignment="center"); relative=rel.get(e.get("_id"),rel.get(f"__order_{order}","—"))
-            with row[0]: st.markdown(f"**{html.escape(str(e.get('Event','')))}**",unsafe_allow_html=True)
-            with row[1]: st.caption(relative)
-            with row[2]: st.caption(str(e.get("Absolute time","")))
-            with row[3]: st.caption(str(e.get("Details","")).strip() or "—")
+    st.markdown(
+        '<div class="ts-section-title">Anesthesia summary</div>',
+        unsafe_allow_html=True,
+    )
+    body = []
+    for row_data in rows:
+        body.append(
+            "<tr>"
+            f'<td class="ts-strong">{html.escape(str(row_data["dose"]))}</td>'
+            f'<td>{html.escape(str(row_data["type"]))}</td>'
+            f'<td>{html.escape(str(row_data["relative"]))}</td>'
+            f'<td>{html.escape(str(row_data["absolute"]))}</td>'
+            f'<td>{html.escape(str(row_data["weight"]))}</td>'
+            f'<td>{html.escape(str(row_data["volume"]))}</td>'
+            "</tr>"
+        )
+
+    st.markdown(
+        """
+        <div class="ts-table-wrap">
+          <table class="ts-table">
+            <colgroup>
+              <col style="width:7%">
+              <col style="width:12%">
+              <col style="width:15%">
+              <col style="width:31%">
+              <col style="width:16%">
+              <col style="width:19%">
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Dose</th>
+                <th>Type</th>
+                <th>Relative</th>
+                <th>Absolute time</th>
+                <th>Weight</th>
+                <th>Volume</th>
+              </tr>
+            </thead>
+            <tbody>
+        """
+        + "".join(body)
+        + """
+            </tbody>
+          </table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_timesheet_event_table(i, log):
+    relative_times = relative_time_map(i, log)
+    event_columns = [1.78, 1.02, 1.66, 2.35, .92]
+
+    with st.container(key=f"timesheet_event_header_{i}"):
+        header = st.columns(event_columns, gap="small")
+        for column, label in zip(
+            header,
+            ["Event", "Relative time", "Absolute time", "Details", "Adjust"],
+        ):
+            with column:
+                st.markdown(
+                    f'<div class="ts-event-header">{html.escape(label)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    for order, event in enumerate(log):
+        event_id = event.get("_id") or f"row_{order}"
+        relative = relative_times.get(
+            event.get("_id"),
+            relative_times.get(f"__order_{order}", "—"),
+        )
+        event_name = str(event.get("Event", ""))
+        absolute = str(event.get("Absolute time", ""))
+        details = str(event.get("Details", "")).strip() or "—"
+
+        with st.container(key=f"timesheet_event_row_{i}_{order}"):
+            row = st.columns(
+                event_columns,
+                gap="small",
+                vertical_alignment="center",
+            )
+            values = (
+                (row[0], event_name, "ts-event-cell primary"),
+                (row[1], relative, "ts-event-cell"),
+                (row[2], absolute, "ts-event-cell"),
+                (row[3], details, "ts-event-cell details"),
+            )
+            for column, value, css_class in values:
+                with column:
+                    st.markdown(
+                        f'<div class="{css_class}">{html.escape(value)}</div>',
+                        unsafe_allow_html=True,
+                    )
+
             with row[4]:
-                if is_backtime_editable_event(e) and st.button("Back-time",key=f"backtime_select_{i}_{e.get('_id')}",use_container_width=True): st.session_state[f"_backtime_target_{i}"]=e.get("_id")
-        target=st.session_state.get(f"_backtime_target_{i}")
-        if target:
-            st.divider(); st.markdown("**Back-time selected event**"); amount=st.number_input(f"{UNIT_WORD.capitalize()} earlier",min_value=.1,step=.5,value=1.0,key=f"backtime_amount_{i}"); left,right=st.columns(2)
-            with left:
-                if st.button("Cancel adjustment",key=f"backtime_cancel_{i}",use_container_width=True): st.session_state.pop(f"_backtime_target_{i}",None); st.rerun()
-            with right:
-                if st.button("Apply back-time",key=f"backtime_apply_{i}",use_container_width=True,type="primary"):
-                    ok,error=backtime_start_event(i,target,amount)
-                    if ok: st.session_state.pop(f"_backtime_target_{i}",None); st.rerun()
-                    st.warning(error)
+                if is_backtime_editable_event(event):
+                    if st.button(
+                        "Back-time",
+                        key=f"backtime_select_{i}_{event_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[f"_backtime_target_{i}"] = event.get("_id")
+                        st.rerun()
+                else:
+                    st.markdown(
+                        '<div class="ts-adjust-placeholder"></div>',
+                        unsafe_allow_html=True,
+                    )
+
+
+def _render_timesheet_backtime_panel(i, log):
+    target = st.session_state.get(f"_backtime_target_{i}")
+    if not target:
+        return
+
+    selected = next((event for event in log if event.get("_id") == target), None)
+    selected_name = (
+        str(selected.get("Event", "Selected event"))
+        if selected
+        else "Selected event"
+    )
+
+    with st.container(key=f"timesheet_backtime_panel_{i}"):
+        st.markdown(
+            f'<div class="ts-section-title">Back-time '
+            f'{html.escape(selected_name)}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="ts-note">Move this timer-start event earlier. '
+            'The correction is recorded in the permanent event log.</div>',
+            unsafe_allow_html=True,
+        )
+
+        amount = st.number_input(
+            f"{UNIT_WORD.capitalize()} earlier",
+            min_value=.1,
+            step=.5,
+            value=1.0,
+            key=f"backtime_amount_{i}",
+        )
+        left, right = st.columns(2)
+
+        with left:
+            if st.button(
+                "Cancel adjustment",
+                key=f"backtime_cancel_{i}",
+                use_container_width=True,
+            ):
+                st.session_state.pop(f"_backtime_target_{i}", None)
+                st.rerun()
+
+        with right:
+            if st.button(
+                "Apply back-time",
+                key=f"backtime_apply_{i}",
+                use_container_width=True,
+                type="primary",
+            ):
+                ok, error = backtime_start_event(i, target, amount)
+                if ok:
+                    st.session_state.pop(f"_backtime_target_{i}", None)
+                    st.rerun()
+                st.warning(error)
+
+
+@st.dialog("Timesheet", width="large")
+def timesheet_dialog(i):
+    st.markdown(
+        f'<div class="ts-title">{html.escape(subject_name(i))} timesheet</div>',
+        unsafe_allow_html=True,
+    )
+    _render_timesheet_measurement_summary(i)
+    _render_timesheet_anesthesia_summary(i)
+
+    st.markdown(
+        '<div class="ts-section-title">Event log</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="ts-note">{html.escape(weight_label(i))} · '
+        f'{html.escape(APP_TIMEZONE)} · '
+        'Timer-start events can be back-timed when a button was clicked late.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    log = list(st.session_state.get(f"event_log_{i}", []))
+    if not log:
+        st.info("No events have been recorded.")
+        return
+
+    _render_timesheet_event_table(i, log)
+    _render_timesheet_backtime_panel(i, log)
+
 
 @st.dialog("Add comment")
 def comment_dialog(i):
-    key=f"comment_text_{i}"; st.session_state.setdefault(key,""); st.markdown(f"**{html.escape(subject_name(i))}**",unsafe_allow_html=True); st.text_area("Comment",key=key,height=130); left,right=st.columns(2)
+    key=f"comment_text_{i}"
+    st.session_state.setdefault(key,"")
+    st.markdown(f"**{html.escape(subject_name(i))}**",unsafe_allow_html=True)
+    st.caption("Comments are timestamped and can be added even after this subject has ended.")
+    st.text_area("Comment",key=key,height=130)
+    left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key=f"comment_cancel_{i}",use_container_width=True): st.session_state.pop(key,None); st.rerun()
+        if st.button("Cancel",key=f"comment_cancel_{i}",use_container_width=True):
+            st.session_state.pop(key,None)
+            st.rerun()
     with right:
         if st.button("Accept",key=f"comment_accept_{i}",use_container_width=True,type="primary"):
             text=str(st.session_state.get(key,"")).strip()
-            if not text: st.warning("Enter a comment.")
-            else: log_event(i,"Comment",text); persist_subject(i); st.session_state.pop(key,None); st.rerun()
-
-@st.dialog("Edit subject")
-def edit_subject_dialog(i):
-    nk,wk=f"edit_name_{i}",f"edit_weight_{i}"; st.session_state.setdefault(nk,subject_name(i)); st.session_state.setdefault(wk,float(mouse_weight(i) or 0.0)); st.text_input("Subject name",key=nk); st.number_input("Weight (g)",min_value=0.0,max_value=100.0,step=.1,format="%.1f",key=wk); left,right=st.columns(2)
-    with left:
-        if st.button("Cancel",key=f"edit_cancel_{i}",use_container_width=True): st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
-    with right:
-        if st.button("Save",key=f"edit_save_{i}",use_container_width=True,type="primary"):
-            name,weight,error=validate_mouse_name_weight(st.session_state.get(nk),st.session_state.get(wk),f"Mouse {i}")
-            if error: st.warning(error)
-            elif weight_requires_confirmation(weight): queue_weight_warning("edit_subject",[{"name":name,"weight_g":weight}],mouse=i); st.rerun()
+            if not text:
+                st.warning("Enter a comment.")
             else:
-                ok,error=save_subject_profile(i,name,weight)
-                if ok: st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
-                st.warning(error)
+                log_event(i,"Comment",text)
+                persist_subject(i)
+                st.session_state.pop(key,None)
+                st.rerun()
+
+def _edit_subject_keys(i):
+    return {
+        "name": f"edit_name_{i}",
+        "weight": f"edit_weight_{i}",
+        "starting_map": f"edit_starting_map_{i}",
+        "shock_volume": f"edit_shock_volume_{i}",
+        "ending_map": f"edit_ending_map_{i}",
+        "resuscitation_volume": f"edit_resuscitation_volume_{i}",
+    }
+
+
+def _initialize_edit_subject_widgets(i, keys):
+    current_values = {
+        "name": subject_name(i),
+        "weight": float(mouse_weight(i) or 0.0),
+        "starting_map": "" if starting_map(i) is None else f"{starting_map(i):g}",
+        "shock_volume": "" if shock_volume(i) is None else f"{shock_volume(i):g}",
+        "ending_map": "" if ending_map(i) is None else f"{ending_map(i):g}",
+        "resuscitation_volume": (
+            "" if resuscitation_volume(i) is None else f"{resuscitation_volume(i):g}"
+        ),
+    }
+    for field, key in keys.items():
+        st.session_state.setdefault(key, current_values[field])
+
+
+def _parse_edit_subject_form(i, keys, availability):
+    name, weight, profile_error = validate_mouse_name_weight(
+        st.session_state.get(keys["name"]),
+        st.session_state.get(keys["weight"]),
+        f"Mouse {i}",
+    )
+
+    field_specs = (
+        (
+            "starting_map",
+            starting_map,
+            _parse_optional_map_value,
+            "Starting MAP",
+        ),
+        (
+            "shock_volume",
+            shock_volume,
+            _parse_optional_volume_ml,
+            "Shock volume",
+        ),
+        (
+            "ending_map",
+            ending_map,
+            _parse_optional_map_value,
+            "Ending MAP",
+        ),
+        (
+            "resuscitation_volume",
+            resuscitation_volume,
+            _parse_optional_volume_ml,
+            "Resuscitation volume",
+        ),
+    )
+
+    values = {}
+    errors = [profile_error] if profile_error else []
+    for field, current_getter, parser, label in field_specs:
+        if availability[field]:
+            value, error = parser(st.session_state.get(keys[field]), label)
+        else:
+            value, error = current_getter(i), None
+        values[field] = value
+        if error:
+            errors.append(error)
+
+    edits = {
+        "starting_map_mmhg": values["starting_map"],
+        "shock_volume_ml": values["shock_volume"],
+        "ending_map_mmhg": values["ending_map"],
+        "resuscitation_volume_ml": values["resuscitation_volume"],
+    }
+    return name, weight, edits, errors
+
+
+def _commit_edit_subject_form(i, name, weight, edits):
+    if weight_requires_confirmation(weight):
+        queue_weight_warning(
+            "edit_subject",
+            [{"name": name, "weight_g": weight}],
+            mouse=i,
+            edits=edits,
+        )
+        st.rerun()
+        return
+
+    ok, error, changed = save_subject_data_edits(
+        i,
+        name,
+        weight,
+        edits["starting_map_mmhg"],
+        edits["shock_volume_ml"],
+        edits["ending_map_mmhg"],
+        edits["resuscitation_volume_ml"],
+    )
+    if ok:
+        _clear_edit_subject_widgets(i)
+        st.toast("Subject data updated" if changed else "No subject data changes")
+        st.rerun()
+    st.warning(error)
+
+
+@st.dialog("Edit subject", width="large")
+def edit_subject_dialog(i):
+    keys = _edit_subject_keys(i)
+    availability = edit_subject_field_availability(i)
+    _initialize_edit_subject_widgets(i, keys)
+
+    st.markdown(
+        f"### {html.escape(subject_name(i))} — correct subject data",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Name and weight can always be corrected. Measurement fields unlock only "
+        "after this subject reaches the corresponding data-collection point."
+    )
+
+    profile_cols = st.columns([1.8, 1.0], gap="medium")
+    with profile_cols[0]:
+        st.text_input("Subject name", key=keys["name"])
+    with profile_cols[1]:
+        st.number_input(
+            "Weight (g)",
+            min_value=0.0,
+            max_value=100.0,
+            step=.1,
+            format="%.1f",
+            key=keys["weight"],
+        )
+
+    st.markdown("**Recorded measurements**")
+    measurement_cols = st.columns(2, gap="medium")
+    with measurement_cols[0]:
+        st.text_input(
+            "Starting MAP (mmHg)",
+            key=keys["starting_map"],
+            placeholder=(
+                "Not recorded"
+                if availability["starting_map"]
+                else "Available after shock starts"
+            ),
+            disabled=not availability["starting_map"],
+        )
+        st.text_input(
+            "Shock volume removed (mL)",
+            key=keys["shock_volume"],
+            placeholder=(
+                "Not recorded"
+                if availability["shock_volume"]
+                else "Available when resuscitation starts"
+            ),
+            disabled=not availability["shock_volume"],
+        )
+
+    with measurement_cols[1]:
+        st.text_input(
+            "Ending MAP (mmHg)",
+            key=keys["ending_map"],
+            placeholder=(
+                "Not recorded"
+                if availability["ending_map"]
+                else "Available at the end of resuscitation"
+            ),
+            disabled=not availability["ending_map"],
+        )
+        st.text_input(
+            "Resuscitation volume given (mL)",
+            key=keys["resuscitation_volume"],
+            placeholder=(
+                "Not recorded"
+                if availability["resuscitation_volume"]
+                else "Available at the end of resuscitation"
+            ),
+            disabled=not availability["resuscitation_volume"],
+        )
+
+    st.caption(
+        "Unlocked measurement fields may be left blank to clear an incorrect "
+        "recorded value."
+    )
+
+    left, right = st.columns(2)
+    with left:
+        if st.button("Cancel", key=f"edit_cancel_{i}", use_container_width=True):
+            _clear_edit_subject_widgets(i)
+            st.rerun()
+
+    with right:
+        if st.button(
+            "Save corrections",
+            key=f"edit_save_{i}",
+            use_container_width=True,
+            type="primary",
+        ):
+            name, weight, edits, errors = _parse_edit_subject_form(
+                i,
+                keys,
+                availability,
+            )
+            if errors:
+                st.warning(" ".join(errors))
+            else:
+                _commit_edit_subject_form(i, name, weight, edits)
+
 
 @st.cache_data(show_spinner=False)
 def notification_sound_wav(sound_name):
@@ -3099,10 +4234,23 @@ def notification_sound_wav(sound_name):
         w.writeframes(bytes(frames))
     return buffer.getvalue()
 
+def render_hidden_autoplay_audio(sound_name,key):
+    """Autoplay a sound without exposing Streamlit's audio-player controls."""
+    with st.container(key=f"hidden_audio_{key}"):
+        st.audio(
+            notification_sound_wav(str(sound_name)),
+            format="audio/wav",
+            autoplay=True,
+        )
+
 def queue_notification_sound_sample(): st.session_state["_pending_sound_sample"]={"token":uuid.uuid4().hex,"sound":str(st.session_state.get("settings_notification_sound",DEFAULT_NOTIFICATION_SOUND))}
 def render_notification_sound_sample():
     pending=st.session_state.pop("_pending_sound_sample",None)
-    if pending: st.audio(notification_sound_wav(str(pending.get("sound",DEFAULT_NOTIFICATION_SOUND))),format="audio/wav",autoplay=True)
+    if pending:
+        render_hidden_autoplay_audio(
+            pending.get("sound",DEFAULT_NOTIFICATION_SOUND),
+            "settings_sample",
+        )
 
 @st.dialog("Settings",width="large")
 def settings_dialog():
@@ -3131,6 +4279,26 @@ def _parse_map_value(raw):
     if not (1.0 <= value <= 300.0): return None,"MAP must be between 1 and 300 mmHg."
     return round(value,1),None
 
+def _parse_volume_ml(raw,label="Volume"):
+    try: value=float(raw)
+    except (TypeError,ValueError): return None,f"Enter a valid {label.lower()} in mL."
+    if not (0.0 <= value <= 100.0): return None,f"{label} must be between 0 and 100 mL."
+    return round(value,3),None
+
+def _parse_optional_map_value(raw,label):
+    raw=str(raw or "").strip()
+    if not raw:
+        return None,None
+    value,error=_parse_map_value(raw)
+    return value,(f"{label}: {error}" if error else None)
+
+def _parse_optional_volume_ml(raw,label):
+    raw=str(raw or "").strip()
+    if not raw:
+        return None,None
+    value,error=_parse_volume_ml(raw,label)
+    return value,error
+
 @st.dialog("Starting blood pressure")
 def starting_map_dialog(i):
     st.markdown(f"### {html.escape(subject_name(i))} — starting MAP",unsafe_allow_html=True)
@@ -3148,23 +4316,57 @@ def starting_map_dialog(i):
             log_event(i,"Starting MAP",f"{value:g} mmHg",when_epoch=shock_time)
             persist_subject(i); st.session_state.pop(key,None); st.toast(f"Starting MAP saved: {value:g} mmHg"); st.rerun()
 
-@st.dialog("Ending blood pressure")
-def ending_map_dialog(i,forced=False):
-    st.markdown(f"### {html.escape(subject_name(i))} — ending MAP",unsafe_allow_html=True)
-    st.caption("Record the final mean arterial pressure in mmHg before ending this subject.")
-    key=f"ending_map_entry_{i}"
-    existing=ending_map(i)
+@st.dialog("Start resuscitation")
+def shock_volume_dialog(i):
+    st.markdown(f"### {html.escape(subject_name(i))} — shock volume",unsafe_allow_html=True)
+    st.caption("Resuscitation has started. Record the total volume removed by the end of the shock phase.")
+    key=f"shock_volume_entry_{i}"
+    existing=shock_volume(i)
     st.session_state.setdefault(key,"" if existing is None else f"{existing:g}")
-    st.text_input("MAP (mmHg)",key=key,placeholder="e.g. 75")
+    st.text_input("Shock volume removed (mL)",key=key,placeholder="e.g. 0.8")
+    if st.button("Save shock volume",key=f"shock_volume_save_{i}",use_container_width=True,type="primary"):
+        value,error=_parse_volume_ml(st.session_state.get(key),"Shock volume")
+        if error:
+            st.warning(error)
+        else:
+            st.session_state[f"shock_volume_ml_{i}"]=value
+            event_time=st.session_state.get(f"resus_start_{i}") or time.time()
+            log_event(i,"Shock volume",f"{value:g} mL removed",when_epoch=event_time)
+            persist_subject(i)
+            st.session_state.pop(key,None)
+            st.toast(f"Shock volume saved: {value:g} mL")
+            st.rerun()
+
+@st.dialog("Ending measurements")
+def ending_map_dialog(i,forced=False):
+    st.markdown(f"### {html.escape(subject_name(i))} — ending measurements",unsafe_allow_html=True)
+    st.caption("Record the final MAP and total resuscitation volume before ending this subject.")
+    map_key=f"ending_map_entry_{i}"
+    volume_key=f"resuscitation_volume_entry_{i}"
+    existing_map=ending_map(i)
+    existing_volume=resuscitation_volume(i)
+    st.session_state.setdefault(map_key,"" if existing_map is None else f"{existing_map:g}")
+    st.session_state.setdefault(volume_key,"" if existing_volume is None else f"{existing_volume:g}")
+    st.text_input("Ending MAP (mmHg)",key=map_key,placeholder="e.g. 75")
+    st.text_input("Resuscitation volume given (mL)",key=volume_key,placeholder="e.g. 0.8")
     left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key=f"ending_map_cancel_{i}",use_container_width=True): st.session_state.pop(key,None); st.rerun()
+        if st.button("Cancel",key=f"ending_map_cancel_{i}",use_container_width=True):
+            st.session_state.pop(map_key,None)
+            st.session_state.pop(volume_key,None)
+            st.rerun()
     with right:
-        if st.button("Save MAP & end",key=f"ending_map_save_{i}",use_container_width=True,type="primary"):
-            value,error=_parse_map_value(st.session_state.get(key))
-            if error: st.warning(error)
+        if st.button("Save & end",key=f"ending_map_save_{i}",use_container_width=True,type="primary"):
+            map_value,map_error=_parse_map_value(st.session_state.get(map_key))
+            volume_value,volume_error=_parse_volume_ml(st.session_state.get(volume_key),"Resuscitation volume")
+            errors=[error for error in (map_error,volume_error) if error]
+            if errors:
+                st.warning(" ".join(errors))
             else:
-                st.session_state.pop(key,None); end_mouse(i,bool(forced),ending_map_mmhg=value); st.rerun()
+                st.session_state.pop(map_key,None)
+                st.session_state.pop(volume_key,None)
+                end_mouse(i,bool(forced),ending_map_mmhg=map_value,resuscitation_volume_ml=volume_value)
+                st.rerun()
 
 @st.dialog("Confirm end")
 def end_confirmation_dialog(i):
@@ -3182,34 +4384,242 @@ def reset_confirmation_dialog(i):
     with right:
         if st.button("Reset",key=f"reset_confirm_{i}",use_container_width=True,type="primary"): reset_mouse(i); st.rerun()
 
-@st.dialog("End all subjects")
+END_ALL_INPUT_PREFIXES = (
+    "end_all_start_map_",
+    "end_all_shock_volume_",
+    "end_all_map_",
+    "end_all_resus_volume_",
+)
+
+
+def _end_all_measurement_targets(remaining):
+    return {
+        "starting_map": [
+            i for i in remaining
+            if st.session_state.get(f"shock_start_{i}") is not None
+            and starting_map(i) is None
+        ],
+        "shock_volume": [
+            i for i in remaining
+            if st.session_state.get(f"resus_start_{i}") is not None
+            and shock_volume(i) is None
+        ],
+        "ending": [
+            i for i in remaining
+            if st.session_state.get(f"resus_start_{i}") is not None
+        ],
+    }
+
+
+def _clear_end_all_inputs(remaining):
+    for i in remaining:
+        for prefix in END_ALL_INPUT_PREFIXES:
+            st.session_state.pop(f"{prefix}{i}", None)
+
+
+def _render_end_all_measurement_inputs(remaining, targets):
+    for i in remaining:
+        fields = []
+        if i in targets["starting_map"]:
+            key = f"end_all_start_map_{i}"
+            st.session_state.setdefault(key, "")
+            fields.append(("Starting MAP (mmHg)", key, "e.g. 85"))
+
+        if i in targets["shock_volume"]:
+            key = f"end_all_shock_volume_{i}"
+            st.session_state.setdefault(key, "")
+            fields.append(("Shock volume removed (mL)", key, "e.g. 0.8"))
+
+        if i in targets["ending"]:
+            map_key = f"end_all_map_{i}"
+            resus_key = f"end_all_resus_volume_{i}"
+            existing_map = ending_map(i)
+            existing_resus = resuscitation_volume(i)
+            st.session_state.setdefault(
+                map_key,
+                "" if existing_map is None else f"{existing_map:g}",
+            )
+            st.session_state.setdefault(
+                resus_key,
+                "" if existing_resus is None else f"{existing_resus:g}",
+            )
+            fields.extend([
+                ("Ending MAP (mmHg)", map_key, "e.g. 75"),
+                ("Resuscitation volume (mL)", resus_key, "e.g. 0.8"),
+            ])
+
+        if not fields:
+            continue
+
+        st.markdown(f"**{html.escape(subject_name(i))}**")
+        cols = st.columns(2)
+        for position, (label, key, placeholder) in enumerate(fields):
+            with cols[position % 2]:
+                st.text_input(label, key=key, placeholder=placeholder)
+
+
+def _collect_end_all_measurements(targets):
+    starting_maps = {}
+    shock_volumes = {}
+    ending_maps = {}
+    resuscitation_volumes = {}
+    errors = []
+
+    for i in targets["starting_map"]:
+        value, error = _parse_map_value(st.session_state.get(f"end_all_start_map_{i}"))
+        if error:
+            errors.append(f"{subject_name(i)} starting MAP: {error}")
+        else:
+            starting_maps[i] = value
+
+    for i in targets["shock_volume"]:
+        value, error = _parse_volume_ml(
+            st.session_state.get(f"end_all_shock_volume_{i}"),
+            "Shock volume",
+        )
+        if error:
+            errors.append(f"{subject_name(i)} shock volume: {error}")
+        else:
+            shock_volumes[i] = value
+
+    for i in targets["ending"]:
+        map_value, map_error = _parse_map_value(
+            st.session_state.get(f"end_all_map_{i}")
+        )
+        resus_value, resus_error = _parse_volume_ml(
+            st.session_state.get(f"end_all_resus_volume_{i}"),
+            "Resuscitation volume",
+        )
+
+        if map_error:
+            errors.append(f"{subject_name(i)} ending MAP: {map_error}")
+        else:
+            ending_maps[i] = map_value
+
+        if resus_error:
+            errors.append(f"{subject_name(i)} resuscitation volume: {resus_error}")
+        else:
+            resuscitation_volumes[i] = resus_value
+
+    return (
+        starting_maps,
+        shock_volumes,
+        ending_maps,
+        resuscitation_volumes,
+        errors,
+    )
+
+
+@st.dialog("End all subjects", width="large")
 def end_all_subjects_dialog():
-    remaining=[i for i in ordered_subject_indices() if not is_ended(i)]
+    remaining = [i for i in ordered_subject_indices() if not is_ended(i)]
+    targets = _end_all_measurement_targets(remaining)
+
     st.markdown("### End all subjects?")
-    st.write(f"This ends {len(remaining)} remaining subject{'s' if len(remaining)!=1 else ''} and downloads the aggregate timesheet.")
-    map_targets=[i for i in remaining if st.session_state.get(f"resus_start_{i}") is not None]
-    if map_targets:
-        st.caption("Enter an ending MAP for each subject that has begun resuscitation.")
-        for i in map_targets:
-            key=f"end_all_map_{i}"; existing=ending_map(i); st.session_state.setdefault(key,"" if existing is None else f"{existing:g}")
-            st.text_input(f"{subject_name(i)} ending MAP (mmHg)",key=key,placeholder="e.g. 75")
+    st.write(
+        f"This ends {len(remaining)} remaining subject"
+        f"{'s' if len(remaining) != 1 else ''} and downloads the aggregate timesheet."
+    )
+
+    if any(targets.values()):
+        st.caption(
+            "Required measurements that have already been reached must be "
+            "completed before these subjects can end."
+        )
+
+    _render_end_all_measurement_inputs(remaining, targets)
+
+    left, right = st.columns(2)
+    with left:
+        if st.button("Cancel", key="end_all_cancel", use_container_width=True):
+            _clear_end_all_inputs(remaining)
+            st.rerun()
+
+    with right:
+        if st.button(
+            "End all subjects",
+            key="end_all_confirm",
+            use_container_width=True,
+            type="primary",
+        ):
+            (
+                starting_maps,
+                shock_volumes,
+                ending_maps,
+                resuscitation_volumes,
+                errors,
+            ) = _collect_end_all_measurements(targets)
+
+            if errors:
+                st.warning(" ".join(errors))
+            elif end_all_subjects_current_experiment(
+                ending_maps,
+                resuscitation_volumes,
+                starting_maps,
+                shock_volumes,
+            ):
+                _clear_end_all_inputs(remaining)
+                queue_timesheet_auto_download()
+                st.rerun()
+            else:
+                st.error(
+                    "Subjects were ended locally, but persistent storage has "
+                    "not confirmed the save yet."
+                )
+
+
+@st.dialog("Unsaved changes")
+def storage_exit_dialog():
+    pending=list(st.session_state.get("_unsaved_subjects",[]))
+    names=[
+        subject_name(i)
+        for i in pending
+        if 1<=int(i)<=mouse_count()
+    ]
+
+    st.error(
+        "Recent changes are still only in this browser session. "
+        "Navigation is blocked until persistent storage confirms the save."
+    )
+    if names:
+        st.write("Pending: "+", ".join(names))
+
+    if st.session_state.get("_storage_error"):
+        st.caption(str(st.session_state.get("_storage_error")))
+
+    st.download_button(
+        "⇩ Download emergency backup",
+        data=build_emergency_backup_text(),
+        file_name=emergency_backup_filename(),
+        mime="application/json",
+        key="storage_exit_emergency_download",
+        use_container_width=True,
+    )
+
     left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key="end_all_cancel",use_container_width=True):
-            for i in map_targets: st.session_state.pop(f"end_all_map_{i}",None)
+        if st.button(
+            "Stay in experiment",
+            key="storage_exit_cancel",
+            use_container_width=True,
+        ):
+            st.session_state["_show_storage_exit_dialog"]=False
             st.rerun()
+
     with right:
-        if st.button("End all subjects",key="end_all_confirm",use_container_width=True,type="primary"):
-            ending_maps={}; errors=[]
-            for i in map_targets:
-                value,error=_parse_map_value(st.session_state.get(f"end_all_map_{i}"))
-                if error: errors.append(f"{subject_name(i)}: {error}")
-                else: ending_maps[i]=value
-            if errors: st.warning(" ".join(errors))
-            elif end_all_subjects_current_experiment(ending_maps):
-                for i in map_targets: st.session_state.pop(f"end_all_map_{i}",None)
-                queue_timesheet_auto_download(); st.rerun()
-            else: st.error("Subjects were ended locally, but persistent storage has not confirmed the save yet.")
+        if st.button(
+            "Retry save & leave",
+            key="storage_exit_retry",
+            use_container_width=True,
+            type="primary",
+        ):
+            if retry_unsaved_subjects():
+                st.session_state.clear()
+                st.rerun()
+            st.error(
+                "Save is still unconfirmed. Download the emergency backup "
+                "and retry when storage is available."
+            )
 
 @st.dialog("Add mouse")
 def add_mouse_dialog():
@@ -3234,8 +4644,16 @@ def request_dialog(i,kind,**extra):
     st.session_state["_pending_dialog"]={"mouse":int(i),"kind":kind,**extra}
     st.session_state["_needs_full_rerun"]=True
 def request_end_dialog(i,forced=False):
-    if st.session_state.get(f"resus_start_{i}") is not None: request_dialog(i,"ending_map",forced=bool(forced))
-    else: request_dialog(i,"end")
+    if st.session_state.get(f"shock_start_{i}") is not None and starting_map(i) is None:
+        request_dialog(i,"starting_map")
+        return
+    if st.session_state.get(f"resus_start_{i}") is not None:
+        if shock_volume(i) is None:
+            request_dialog(i,"shock_volume")
+            return
+        request_dialog(i,"ending_map",forced=bool(forced))
+        return
+    request_dialog(i,"end")
 def _rerun_entire_app():
     """Force an app-level rerun even when invoked from inside a Streamlit fragment."""
     try:
@@ -3244,8 +4662,6 @@ def _rerun_entire_app():
         # Compatibility fallback for Streamlit versions without the scope kwarg.
         st.rerun()
 
-def request_add_mouse_dialog(): st.session_state["_pending_dialog"]={"mouse":0,"kind":"add_mouse"}
-def request_dialog(i,kind): st.session_state["_pending_dialog"]={"mouse":int(i),"kind":kind}
 def render_pending_dialog():
     req=st.session_state.pop("_pending_dialog",None)
     if not req: return
@@ -3254,6 +4670,7 @@ def render_pending_dialog():
     i=int(req.get("mouse",0))
     if not 1<=i<=mouse_count(): return
     if kind=="starting_map": starting_map_dialog(i); return
+    if kind=="shock_volume": shock_volume_dialog(i); return
     if kind=="ending_map": ending_map_dialog(i,bool(req.get("forced",False))); return
     {"timesheet":timesheet_dialog,"comment":comment_dialog,"edit":edit_subject_dialog,"end":end_confirmation_dialog,"reset":reset_confirmation_dialog}.get(kind,lambda _:None)(i)
 
@@ -3282,51 +4699,56 @@ def action_targets_for_alert(i,event,remaining):
     if remaining<=0: return [{"key":f"primary_action_{i}","style":"primary"}]
     return []
 
-def collect_attention_items(wall_now):
-    """Return sticky warning/overdue alerts for the current timer frame."""
-    sticky = st.session_state.setdefault("_sticky_alerts", {})
-    active_keys = set()
+def collect_attention_items(wall_now, indices=None):
+    """Return sticky alerts for time-based workflow events only."""
+    if indices is None:
+        indices=ordered_subject_indices()
 
-    for i in ordered_subject_indices():
+    sticky=st.session_state.setdefault("_sticky_alerts",{})
+    active_keys=set()
+
+    for i in indices:
         if is_ended(i):
             clear_mouse_alerts(i)
             continue
 
-        now = effective_now(i, wall_now)
-        for event, remaining in get_upcoming_events(i, now):
-            key = alert_key(i, event)
-            active_keys.add(key)
-            level = urgency_for_remaining(remaining)
+        now=effective_now(i,wall_now)
 
-            # Sticky alerts appear once they enter warning or overdue state and
-            # remain present until the underlying task is resolved.
-            if level in ("orange", "red"):
-                sticky[key] = {
-                    "mouse": i,
-                    "name": subject_name(i),
-                    "event": event,
-                    "remaining": remaining,
-                    "level": level,
+        # Data-entry recovery states (for example Enter MAP / Enter shock vol)
+        # intentionally stay in the row action model, not the global alert/audio
+        # system. Only time-based workflow events belong in this collection.
+        for event,remaining in get_upcoming_events(i,now):
+            key=alert_key(i,event)
+            active_keys.add(key)
+            level=urgency_for_remaining(remaining)
+
+            if level in ("orange","red"):
+                sticky[key]={
+                    "mouse":i,
+                    "name":subject_name(i),
+                    "event":event,
+                    "remaining":remaining,
+                    "level":level,
                 }
 
-    # Drop alerts whose underlying task no longer exists.
     for key in tuple(sticky):
         if key not in active_keys:
-            sticky.pop(key, None)
+            sticky.pop(key,None)
 
-    items = []
+    items=[]
     for alert in sticky.values():
-        item = dict(alert)
-        item["targets"] = action_targets_for_alert(
-            item["mouse"], item["event"], item["remaining"]
+        item=dict(alert)
+        item["targets"]=action_targets_for_alert(
+            item["mouse"],
+            item["event"],
+            item["remaining"],
         )
         items.append(item)
 
-    # Overdue items sort before upcoming warnings, then by time remaining.
     return sorted(
         items,
-        key=lambda item: (
-            0 if item["level"] == "red" else 1,
+        key=lambda item:(
+            0 if item["level"]=="red" else 1,
             item["remaining"],
         ),
     )
@@ -3388,8 +4810,13 @@ def render_pending_auto_download_marker():
     pending=st.session_state.get("_pending_auto_download")
     if pending: st.html(f'<div data-lab-auto-download-token="{html.escape(pending["token"],quote=True)}" data-lab-auto-download-filename="{html.escape(pending["filename"],quote=True)}" data-lab-auto-download-content="{pending["content_b64"]}" style="display:none!important"></div>')
 
-def install_browser_helpers():
-    components.html(r"""
+def render_run_active_marker():
+    st.html(
+        '<div data-lab-run-active="1" '
+        'style="display:none!important"></div>'
+    )
+
+BROWSER_HELPERS_HTML = r"""
     <script>
     (()=>{
       const root=window.parent;
@@ -3690,6 +5117,167 @@ def install_browser_helpers():
         }catch(_){}
       }
 
+      /*
+        Autofocus data-entry dialogs. Streamlit does not expose a reliable
+        per-widget autofocus option, so detect the visible dialog in the parent
+        document and select its first editable text/numeric field. Reset the
+        signature when the dialog closes so reopening the same dialog focuses
+        it again.
+      */
+      const F=root.__shockTimerDialogFocusState||(root.__shockTimerDialogFocusState={
+        signature:null
+      });
+
+      function closeSubjectMenuForDialog(dialog){
+        /*
+          The subject popover can otherwise remain visually open after one of
+          its buttons launches a Streamlit dialog. Close only the individual
+          subject menu, not unrelated selects/popovers inside the dialog.
+        */
+        const popovers=[...doc.querySelectorAll(
+          '[data-testid="stPopoverBody"],[data-baseweb="popover"]'
+        )].filter(p=>p.getClientRects().length && !dialog.contains(p));
+
+        const subjectPopover=popovers.find(p=>{
+          const t=(p.textContent||'');
+          return t.includes('View timesheet') &&
+                 t.includes('Add comment') &&
+                 t.includes('Edit subject');
+        });
+
+        if(!subjectPopover) return;
+
+        const trigger=[...doc.querySelectorAll('button[aria-expanded="true"]')]
+          .find(b=>{
+            if(dialog.contains(b)) return false;
+            const t=(b.textContent||'').trim();
+            return t==='⋮' || t.includes('⋮');
+          });
+
+        if(trigger){
+          try{
+            trigger.click();
+            return;
+          }catch(_){}
+        }
+
+        // Fallback for Streamlit/BaseWeb versions that do not expose
+        // aria-expanded on the popover trigger.
+        try{
+          subjectPopover.dispatchEvent(new KeyboardEvent('keydown',{
+            key:'Escape',
+            code:'Escape',
+            bubbles:true,
+            cancelable:true
+          }));
+        }catch(_){}
+      }
+
+      function autofocusDialog(){
+        const dialogs=[...doc.querySelectorAll(
+          '[data-testid="stDialog"] [role="dialog"],[role="dialog"][aria-modal="true"]'
+        )].filter(d=>d.getClientRects().length);
+
+        if(!dialogs.length){
+          F.signature=null;
+          return;
+        }
+
+        const dialog=dialogs[dialogs.length-1];
+        closeSubjectMenuForDialog(dialog);
+
+        const target=dialog.querySelector(
+          '[data-testid="stTextInput"] input:not(:disabled):not([readonly]),' +
+          '[data-testid="stNumberInput"] input:not(:disabled):not([readonly]),' +
+          '[data-testid="stTextArea"] textarea:not(:disabled):not([readonly])'
+        );
+        if(!target) return;
+
+        const heading=[...dialog.querySelectorAll('h1,h2,h3,strong')]
+          .slice(0,2)
+          .map(n=>(n.textContent||'').trim())
+          .join('|');
+        const label=target.getAttribute('aria-label')||
+                    target.getAttribute('placeholder')||
+                    target.getAttribute('name')||'entry';
+        const signature=heading+'|'+label;
+
+        if(F.signature===signature) return;
+
+        try{
+          target.focus({preventScroll:true});
+          if(typeof target.select==='function') target.select();
+          if(doc.activeElement===target) F.signature=signature;
+        }catch(_){}
+      }
+
+      const W=root.__shockTimerWakeState||(root.__shockTimerWakeState={
+        lock:null,
+        bound:false,
+        requesting:false
+      });
+
+      async function maintainWakeLock(){
+        const active=!!doc.querySelector('[data-lab-run-active="1"]');
+        const wakeApi=root.navigator&&root.navigator.wakeLock;
+
+        if(!active){
+          if(W.lock){
+            try{ await W.lock.release(); }catch(_){}
+            W.lock=null;
+          }
+          return;
+        }
+
+        if(!wakeApi||!wakeApi.request||doc.visibilityState!=='visible'){
+          return;
+        }
+
+        if(W.lock||W.requesting) return;
+        W.requesting=true;
+        try{
+          const lock=await wakeApi.request('screen');
+          W.lock=lock;
+          lock.addEventListener('release',()=>{
+            if(W.lock===lock) W.lock=null;
+          });
+        }catch(_){
+          W.lock=null;
+        }finally{
+          W.requesting=false;
+        }
+      }
+
+      if(!W.bound){
+        doc.addEventListener('visibilitychange',()=>{
+          if(doc.visibilityState==='visible') maintainWakeLock();
+        });
+        W.bound=true;
+      }
+
+      function preflightStatus(){
+        const nodes=doc.querySelectorAll('[data-lab-preflight-browser-status]');
+        if(!nodes.length) return;
+
+        const C=root.AudioContext||root.webkitAudioContext;
+        const audioSupported=!!C;
+        const wakeSupported=!!(
+          root.navigator&&
+          root.navigator.wakeLock&&
+          root.navigator.wakeLock.request
+        );
+
+        const audioReady=audioSupported&&A.unlocked;
+        const html=
+          `<span class="${audioReady?'ok':'warn'}">`+
+          `Alert audio: ${audioReady?'ready':'needs test/interaction'}</span>`+
+          ` &nbsp;·&nbsp; `+
+          `<span class="${wakeSupported?'ok':'warn'}">`+
+          `Screen wake: ${wakeSupported?'supported':'manual keep-awake required'}</span>`;
+
+        nodes.forEach(n=>{ n.innerHTML=html; });
+      }
+
       function poll(){
         const ss=doc.querySelectorAll('[data-lab-attention-snapshot]');
         if(ss.length){
@@ -3699,13 +5287,58 @@ def install_browser_helpers():
         highlights();
         full();
         download();
+        autofocusDialog();
+        preflightStatus();
+        maintainWakeLock();
       }
 
       poll();
       setInterval(poll,100);
     })();
     </script>
-    """,width=1,height=1,tab_index=-1)
+    """
+
+
+def install_browser_helpers():
+    """Mount the browser-only helper layer used by the Streamlit UI."""
+    st.iframe(BROWSER_HELPERS_HTML, width=1, height=1, tab_index=-1)
+
+
+def render_storage_failure_warning():
+    if not st.session_state.get("_storage_error"):
+        return
+
+    with st.container(key="persistent_storage_failure"):
+        st.error(
+            "SAVE WARNING: recent changes have not been confirmed by "
+            "persistent storage. The experiment remains available in this "
+            "browser session."
+        )
+        st.caption(str(st.session_state.get("_storage_error")))
+
+        retry_col,backup_col=st.columns(2)
+        with retry_col:
+            if st.button(
+                "Retry save",
+                key="retry_storage_save",
+                use_container_width=True,
+                type="primary",
+            ):
+                if retry_unsaved_subjects():
+                    st.toast("Persistent save confirmed.")
+                    st.rerun()
+                st.error("Save is still unconfirmed.")
+
+        with backup_col:
+            st.download_button(
+                "⇩ Emergency backup",
+                data=build_emergency_backup_text(),
+                file_name=emergency_backup_filename(),
+                mime="application/json",
+                key="storage_warning_emergency_download",
+                use_container_width=True,
+            )
+
 # ============================================================
 # DISPLAY / WORKFLOW
 # ============================================================
@@ -3718,6 +5351,16 @@ def mouse_status_tone(i,now):
 def get_next_event_display(i,now):
     if is_ended(i): return "Ended","gray"
     if st.session_state.get(f"experiment_start_{i}") is None: return "Not started","gray"
+    if (
+        st.session_state.get(f"shock_start_{i}") is not None
+        and starting_map(i) is None
+    ):
+        return "Starting MAP required","red"
+    if (
+        st.session_state.get(f"resus_start_{i}") is not None
+        and shock_volume(i) is None
+    ):
+        return "Shock volume required","red"
     upcoming=get_upcoming_events(i,now)
     if not upcoming: return "Ready","green"
     event,remaining=min(upcoming,key=lambda x:x[1]); tone=urgency_for_remaining(remaining); friendly={"Anesthesia redose":"Anesthesia","Shock":"Shock","Resuscitation":"Resus","Resuscitation complete":"Resus"}[event]
@@ -3729,6 +5372,7 @@ def get_next_event_display(i,now):
     return f"{friendly} in {format_timer(remaining)}",tone
 
 def anesthesia_display(i,now):
+    if is_ended(i): return "Ended",weight_label(i),"gray"
     start=st.session_state.get(f"anesthesia_start_{i}")
     if start is None: return "Not started",weight_label(i),"gray"
     remaining=anesthesia_remaining(i,now); tone=urgency_for_remaining(remaining); label="First redose" if anesthesia_dose_count(i)<=1 else "Redose"; return (f"{label} due",weight_label(i),tone) if remaining<=0 else (f"{label} in {format_timer(remaining)}",weight_label(i),tone if tone!="normal" else "normal")
@@ -3798,6 +5442,10 @@ def actionable_event_for_mouse(i,now):
     if is_paused(i): return "resume"
     anes,board,shock,resus=st.session_state.get(f"anesthesia_start_{i}"),st.session_state.get(f"board_start_{i}"),st.session_state.get(f"shock_start_{i}"),st.session_state.get(f"resus_start_{i}")
     if anes is None: return "start_anesthesia"
+    if shock is not None and starting_map(i) is None:
+        return "enter_starting_map"
+    if resus is not None and shock_volume(i) is None:
+        return "enter_shock_volume"
     due=[]
     if board is not None and shock is None:
         rem=remaining_from_start(board,FIXED_BOARD_DURATION,now)
@@ -3814,22 +5462,96 @@ def actionable_event_for_mouse(i,now):
 
 def render_primary_action(i,now):
     action=actionable_event_for_mouse(i,now)
-    if action is None: st.button("Ended",key=f"ended_display_button_{i}",disabled=True,use_container_width=True); return
-    mapping={"resume":("▶ Resume",toggle_pause),"start_anesthesia":("▷ Start",start_or_redose_anesthesia),"start_board":("▷ Start board",start_board),"start_shock":("⚡ Start shock",start_shock),"start_resus":("♥ Start resus",start_resuscitation)}
+    if action is None:
+        st.button(
+            "Ended",
+            key=f"ended_display_button_{i}",
+            disabled=True,
+            use_container_width=True,
+        )
+        return
+
+    if action=="enter_starting_map":
+        with st.container(key=f"primary_action_{i}"):
+            st.button(
+                "Enter MAP",
+                key=f"primary_enter_starting_map_{i}",
+                use_container_width=True,
+                on_click=request_dialog,
+                args=(i,"starting_map"),
+            )
+        return
+
+    if action=="enter_shock_volume":
+        with st.container(key=f"primary_action_{i}"):
+            st.button(
+                "Enter shock vol",
+                key=f"primary_enter_shock_volume_{i}",
+                use_container_width=True,
+                on_click=request_dialog,
+                args=(i,"shock_volume"),
+            )
+        return
+
+    mapping={
+        "resume":("▶ Resume",toggle_pause),
+        "start_anesthesia":("▷ Start",start_or_redose_anesthesia),
+        "start_board":("▷ Start board",start_board),
+        "start_shock":("⚡ Start shock",start_shock),
+        "start_resus":("♥ Start resus",start_resuscitation),
+    }
     if action in mapping:
         label,fn=mapping[action]
-        wrapper=f"primary_start_anesthesia_wrapper_{i}" if action=="start_anesthesia" else f"primary_action_{i}"
-        with st.container(key=wrapper): st.button(label,key=f"primary_{action}_{i}",use_container_width=True,on_click=fn,args=(i,)); return
+        wrapper=(
+            f"primary_start_anesthesia_wrapper_{i}"
+            if action=="start_anesthesia"
+            else f"primary_action_{i}"
+        )
+        with st.container(key=wrapper):
+            st.button(
+                label,
+                key=f"primary_{action}_{i}",
+                use_container_width=True,
+                on_click=fn,
+                args=(i,),
+            )
+        return
+
     if action=="end":
-        with st.container(key=f"primary_action_{i}"): st.button("■ End",key=f"primary_end_{i}",use_container_width=True,on_click=request_end_dialog,args=(i,False)); return
-    with st.container(key=f"primary_pause_{i}"): st.button("Ⅱ Pause",key=f"primary_pause_button_{i}",use_container_width=True,on_click=toggle_pause,args=(i,))
+        with st.container(key=f"primary_action_{i}"):
+            st.button(
+                "■ End",
+                key=f"primary_end_{i}",
+                use_container_width=True,
+                on_click=request_end_dialog,
+                args=(i,False),
+            )
+        return
+
+    with st.container(key=f"primary_pause_{i}"):
+        st.button(
+            "Ⅱ Pause",
+            key=f"primary_pause_button_{i}",
+            use_container_width=True,
+            on_click=toggle_pause,
+            args=(i,),
+        )
 
 def force_advance_label(i,now):
     if is_ended(i) or is_paused(i): return None
     board,shock,resus=st.session_state.get(f"board_start_{i}"),st.session_state.get(f"shock_start_{i}"),st.session_state.get(f"resus_start_{i}")
-    if board is not None and shock is None and not board_is_complete(i,now): return "⏭ Force start shock"
-    if shock is not None and resus is None and not shock_is_complete(i,now): return "⏭ Force start resus"
-    if resus is not None and not resus_is_complete(i,now): return "⏭ Force end subject"
+    if board is not None and shock is None and not board_is_complete(i,now):
+        return "⏭ Force start shock"
+    if shock is not None and resus is None:
+        if starting_map(i) is None:
+            return None
+        if not shock_is_complete(i,now):
+            return "⏭ Force start resus"
+    if resus is not None:
+        if shock_volume(i) is None:
+            return None
+        if not resus_is_complete(i,now):
+            return "⏭ Force end subject"
     return None
 
 def force_advance(i):
@@ -3839,36 +5561,89 @@ def force_advance(i):
     elif label=="⏭ Force end subject": request_end_dialog(i,True)
 
 def _process_menu(i,selection):
-    if not selection: return
-    if selection=="View timesheet": request_dialog(i,"timesheet"); st.rerun()
-    elif selection=="Add comment": request_dialog(i,"comment"); st.rerun()
-    elif selection=="Edit subject": request_dialog(i,"edit"); st.rerun()
-    elif selection in ("Ⅱ Pause","▶ Resume"): toggle_pause(i); st.rerun()
-    elif selection=="↑ Move up": move_subject(i,-1); st.rerun()
-    elif selection=="↓ Move down": move_subject(i,1); st.rerun()
-    elif selection.startswith("↶ Undo"): undo_last_stage_action(i); st.rerun()
-    elif selection.startswith("⏭ Force"): force_advance(i); st.rerun()
-    elif selection=="↻ Reset subject": request_dialog(i,"reset"); st.rerun()
-    elif selection=="■ End subject": request_end_dialog(i,False); st.rerun()
+    """
+    Handle one individual-subject menu action.
 
-def render_overflow_control(i,now):
-    options=["View timesheet","Add comment","Edit subject"]; group=_reorder_group(i,time.time()); peers=[j for j in ordered_subject_indices() if _reorder_group(j,time.time())==group]
+    This function is used as a button callback inside the timer fragment, so it
+    deliberately does not call st.rerun(). The button interaction already
+    triggers a fragment rerun. Dialog requests are promoted to a full-app rerun
+    by show_timers() before the fragment renders again.
+    """
+    if not selection:
+        return
+    if selection=="View timesheet":
+        request_dialog(i,"timesheet")
+    elif selection=="Add comment":
+        request_dialog(i,"comment")
+    elif selection=="Edit subject":
+        request_dialog(i,"edit")
+    elif selection in ("Ⅱ Pause","▶ Resume"):
+        toggle_pause(i)
+    elif selection=="↑ Move up":
+        move_subject(i,-1)
+    elif selection=="↓ Move down":
+        move_subject(i,1)
+    elif selection.startswith("↶ Undo"):
+        undo_last_stage_action(i)
+    elif selection.startswith("⏭ Force"):
+        force_advance(i)
+    elif selection=="↻ Reset subject":
+        request_dialog(i,"reset")
+    elif selection=="■ End subject":
+        request_end_dialog(i,False)
+
+def render_overflow_control(i,now,reorder_peers=None):
+    # Record-management actions are always available, including before the first
+    # timer starts and after the subject has ended.
+    options=["View timesheet","Add comment","Edit subject"]
+
+    if reorder_peers is None:
+        order_now=time.time()
+        group=_reorder_group(i,order_now)
+        peers=[
+            j for j in ordered_subject_indices()
+            if _reorder_group(j,order_now)==group
+        ]
+    else:
+        peers=reorder_peers
     if i in peers:
         pos=peers.index(i)
-        if pos>0: options.append("↑ Move up")
-        if pos<len(peers)-1: options.append("↓ Move down")
+        if pos>0:
+            options.append("↑ Move up")
+        if pos<len(peers)-1:
+            options.append("↓ Move down")
+
+    # Timer-changing actions remain limited to active subjects.
     undo=latest_undo_action(i)
-    if undo and not is_ended(i): options.append(f"↶ Undo {_undo_label(undo)}")
+    if undo and not is_ended(i):
+        options.append(f"↶ Undo {_undo_label(undo)}")
+
     force=force_advance_label(i,now)
-    if force: options.append(force)
-    if st.session_state.get(f"experiment_start_{i}") is not None and not is_ended(i): options += ["▶ Resume" if is_paused(i) else "Ⅱ Pause","↻ Reset subject","■ End subject"]
+    if force:
+        options.append(force)
+
+    if (
+        st.session_state.get(f"experiment_start_{i}") is not None
+        and not is_ended(i)
+    ):
+        options += [
+            "▶ Resume" if is_paused(i) else "Ⅱ Pause",
+            "↻ Reset subject",
+            "■ End subject",
+        ]
+
+    # Always use the popover/button path. It is reliable inside the 1-second
+    # Streamlit fragment and works identically for active and ended rows.
     with st.container(key=f"mouse_action_menu_{i}"):
-        if hasattr(st,"menu_button"):
-            selection=st.menu_button("⋮",options=options,key=f"menu_{i}",width="stretch"); _process_menu(i,selection)
-        else:
-            with st.popover("⋮",use_container_width=True):
-                for option in options:
-                    if st.button(option,key=f"fallback_menu_{i}_{option}",use_container_width=True): _process_menu(i,option)
+        with st.popover("⋮",use_container_width=True):
+            for option in options:
+                st.button(
+                    option,
+                    key=f"subject_menu_{i}_{option}",
+                    use_container_width=True,
+                    on_click=_process_menu,
+                    args=(i,option),
+                )
 
 # ============================================================
 # V40 CARD ROW
@@ -3908,7 +5683,7 @@ def _v40_next_event_html(text,tone):
         '</div>'
     )
 
-def render_mouse_row(i, wall_now, finished=False):
+def render_mouse_row(i, wall_now, finished=False, reorder_peers=None):
     """Render one subject row. Timer calculations use a single effective timestamp."""
     now = effective_now(i, wall_now)
     experiment_start = st.session_state.get(f"experiment_start_{i}")
@@ -4007,66 +5782,157 @@ def render_mouse_row(i, wall_now, finished=False):
             with actions[0]:
                 render_primary_action(i, now)
             with actions[1]:
-                render_overflow_control(i, now)
+                render_overflow_control(i, now, reorder_peers)
 
 
 @st.fragment(run_every=REFRESH_INTERVAL)
 def show_timers():
     if st.session_state.get("_pending_dialog"):
-        st.session_state["_needs_full_rerun"]=False
+        st.session_state["_needs_full_rerun"] = False
         _rerun_entire_app()
-    if st.session_state.pop("_needs_full_rerun",False):
+    if st.session_state.pop("_needs_full_rerun", False):
         _rerun_entire_app()
-    wall_now=time.time()
-    attention_items=collect_attention_items(wall_now)
-    render_attention_snapshot(attention_items)
-    active=[]
-    completed=[]
-    for i in ordered_subject_indices(): (completed if mouse_is_complete(i,effective_now(i,wall_now)) else active).append(i)
-    for i in active: render_mouse_row(i,wall_now,False)
-    with st.container(key="add_mouse_card"): st.button("⊕  + Add mouse",key="add_mouse_subject",use_container_width=True,on_click=request_add_mouse_dialog)
+
+    wall_now = time.time()
+    ordered = ordered_subject_indices()
+    render_attention_snapshot(collect_attention_items(wall_now, ordered))
+
+    active = []
+    completed = []
+    for i in ordered:
+        target = completed if mouse_is_complete(i, effective_now(i, wall_now)) else active
+        target.append(i)
+
+    for i in active:
+        render_mouse_row(i, wall_now, False, active)
+
+    with st.container(key="add_mouse_card"):
+        st.button(
+            "⊕  + Add mouse",
+            key="add_mouse_subject",
+            use_container_width=True,
+            on_click=request_add_mouse_dialog,
+        )
+
     if completed:
-        st.markdown('<div class="lab-completed-section-title">Completed / Ended</div>',unsafe_allow_html=True)
-        for i in completed: render_mouse_row(i,wall_now,True)
+        st.markdown(
+            '<div class="lab-completed-section-title">Completed / Ended</div>',
+            unsafe_allow_html=True,
+        )
+        for i in completed:
+            render_mouse_row(i, wall_now, True, completed)
 
 # ============================================================
-# ENTRY POINT
+# APP ORCHESTRATION / ENTRY POINT
 # ============================================================
 
-initialize_state()
+def render_active_experiment_header():
+    """Render the fixed experiment toolbar without mutating timer state."""
+    header = st.columns(HEADER_COLUMNS, vertical_alignment="center")
 
-if not st.session_state.get("_active_experiment_id"):
-    render_experiment_home(); st.stop()
+    with header[0]:
+        if st.button(
+            "← Experiments",
+            key="back_to_experiments",
+            use_container_width=True,
+        ):
+            return_to_experiment_home()
 
-retry_unsaved_subjects()
-if st.session_state.get("_pending_weight_warning"): weight_warning_dialog()
-else: render_pending_dialog()
-render_pending_auto_download_marker(); install_browser_helpers()
+    with header[1]:
+        exp_name = html.escape(
+            str(st.session_state.get("_active_experiment_name", "Experiment"))
+        )
+        st.markdown(
+            f'<div class="lab-header-title">{exp_name}</div>'
+            f'<div class="lab-header-subtitle">'
+            f'{mouse_count()} mice · persistent session</div>',
+            unsafe_allow_html=True,
+        )
 
-header = st.columns(HEADER_COLUMNS, vertical_alignment="center")
-with header[0]:
-    if st.button("← Experiments",key="back_to_experiments",use_container_width=True): return_to_experiment_home()
-with header[1]:
-    exp_name=html.escape(str(st.session_state.get("_active_experiment_name","Experiment")))
-    st.markdown(f'<div class="lab-header-title">{exp_name}</div><div class="lab-header-subtitle">{mouse_count()} mice · persistent session</div>',unsafe_allow_html=True)
-with header[2]: st.button("⛶ Full screen",key="fullscreen_view",use_container_width=True)
-with header[3]:
-    available=global_undo_available(); target=global_undo_label(); help_text=f"Undo: {target}" if available else "No action available to undo"
-    if st.button("↶ Undo",key=f"global_undo_{global_undo_token()}",use_container_width=True,disabled=not available,help=help_text): global_undo_last_action(); st.rerun()
-with header[4]:
-    st.download_button(
-        "⇩ Export timesheets",
-        data=build_all_timesheets_text(),
-        file_name=timesheet_export_filename(),
-        mime="text/plain",
-        key="export_timesheets",
-        use_container_width=True,
-    )
-with header[5]:
-    if st.button("■ End all subjects",key="end_all_subjects",use_container_width=True): end_all_subjects_dialog()
-with header[6]:
-    if st.button("⚙ Settings",key="open_settings",use_container_width=True): settings_dialog()
+    with header[2]:
+        st.button(
+            "⛶ Full screen",
+            key="fullscreen_view",
+            use_container_width=True,
+        )
 
-if st.session_state.get("_storage_error"): st.error("SAVE WARNING: recent changes have not been confirmed by persistent storage. "+str(st.session_state["_storage_error"]))
-st.markdown('<div class="lab-divider"></div>',unsafe_allow_html=True)
-show_timers()
+    with header[3]:
+        available = global_undo_available()
+        target = global_undo_label()
+        help_text = f"Undo: {target}" if available else "No action available to undo"
+        if st.button(
+            "↶ Undo",
+            key=f"global_undo_{global_undo_token()}",
+            use_container_width=True,
+            disabled=not available,
+            help=help_text,
+        ):
+            global_undo_last_action()
+            st.rerun()
+
+    with header[4]:
+        st.download_button(
+            "⇩ Export timesheets",
+            data=build_all_timesheets_text(),
+            file_name=timesheet_export_filename(),
+            mime="text/plain",
+            key="export_timesheets",
+            use_container_width=True,
+        )
+
+    with header[5]:
+        if st.button(
+            "■ End all subjects",
+            key="end_all_subjects",
+            use_container_width=True,
+        ):
+            end_all_subjects_dialog()
+
+    with header[6]:
+        if st.button(
+            "⚙ Settings",
+            key="open_settings",
+            use_container_width=True,
+        ):
+            settings_dialog()
+
+
+def render_active_experiment():
+    """Render the active experiment shell around the 1-second timer fragment."""
+    render_run_active_marker()
+    retry_unsaved_subjects()
+
+    if st.session_state.get("_pending_weight_warning"):
+        weight_warning_dialog()
+    else:
+        render_pending_dialog()
+
+    if st.session_state.get("_show_storage_exit_dialog"):
+        storage_exit_dialog()
+
+    render_pending_auto_download_marker()
+    render_active_experiment_header()
+    render_storage_failure_warning()
+    st.markdown('<div class="lab-divider"></div>', unsafe_allow_html=True)
+    show_timers()
+
+
+def main():
+    """Initialize shared resources, then render the home or active-run surface."""
+    install_app_styles()
+    initialize_database()
+    initialize_state()
+
+    # Browser helpers are installed on both the home/configuration screen and
+    # the active experiment so preflight can inspect capabilities before launch.
+    install_browser_helpers()
+
+    if not st.session_state.get("_active_experiment_id"):
+        render_experiment_home()
+        st.stop()
+
+    render_active_experiment()
+
+
+if __name__ == "__main__":
+    main()
