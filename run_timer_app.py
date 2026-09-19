@@ -26,6 +26,7 @@ import random
 import re
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import uuid
@@ -41,11 +42,15 @@ import streamlit.components.v1 as components
 # APP SETTINGS
 # ============================================================
 
-# Change ONLY this line to switch modes:
-TESTING_MODE = False
+# Run ``streamlit run run_timer_app.py -- --test`` for abbreviated test
+# durations. The ``--`` separator is required by Streamlit before script args.
+# Production remains the default when no script argument is supplied.
+TESTING_MODE = "--test" in sys.argv
 
 # Production uses minutes. Testing uses the same numeric durations as seconds.
 TIME_UNIT = "seconds" if TESTING_MODE else "minutes"
+# Streamlit owns the rendered DOM. Keep its one-second server refresh instead
+# of mutating countdown elements from browser-side JavaScript.
 REFRESH_INTERVAL = 1.0
 
 DEFAULT_INITIAL_ANESTHESIA = 45
@@ -54,6 +59,9 @@ DEFAULT_ANESTHESIA_DELAY = 5
 DEFAULT_NOTIFICATION_SOUND_ENABLED = True
 DEFAULT_NOTIFICATION_SOUND = "Chime"
 NOTIFICATION_SOUND_OPTIONS = ["Chime", "Beep", "Double beep"]
+
+# Each anesthetic administration uses 0.01 mL per gram of recorded weight.
+ANESTHESIA_DOSE_VOLUME_ML_PER_G = 0.01
 
 FIXED_BOARD_DURATION = 10
 FIXED_SHOCK_DURATION = 60
@@ -189,7 +197,9 @@ APP_CSS = r"""
     .lab-step{flex:1 1 0!important;min-width:0!important;position:relative!important;text-align:center!important}
     .lab-step:not(:last-child)::after{content:""!important;position:absolute!important;z-index:0!important;top:.69rem!important;left:calc(50% + .78rem)!important;right:calc(-50% + .78rem)!important;height:2px!important;background:rgba(117,137,157,.34)!important;border-radius:999px}
     .lab-step.complete:not(:last-child)::after{background:rgba(94,210,118,.72)!important}
-    .lab-step.active:not(:last-child)::after{background:linear-gradient(90deg,rgba(22,140,255,.76) 0 34%,rgba(117,137,157,.34) 34% 100%)!important}
+    /* Only Board and Shock have fixed endpoints, so only their connectors
+       display a blue elapsed-time progress fill. */
+    .lab-step.timed-progress:not(:last-child)::after{background:linear-gradient(90deg,rgba(22,140,255,.76) 0 var(--lab-progress),rgba(117,137,157,.34) var(--lab-progress) 100%)!important}
     .lab-step-circle{position:relative!important;z-index:1!important;margin:0 auto!important;width:1.38rem!important;height:1.38rem!important;border-radius:50%!important;display:grid!important;place-items:center!important;font-size:.66rem!important;font-weight:800!important;color:#8996a4!important;border:1.5px solid rgba(137,160,184,.40)!important;background:#101b28!important}
     .lab-step.complete .lab-step-circle{background:rgba(94,210,118,.12)!important;border-color:rgba(94,210,118,.82)!important;color:#78e28d!important}
     .lab-step.active .lab-step-circle{background:rgba(22,140,255,.12)!important;border-color:rgba(22,140,255,.88)!important;color:#5eafff!important}
@@ -1841,6 +1851,7 @@ APP_CSS = r"""
     .lab-next-metric.red{
         color:#ff8798!important;
     }
+
     
 """
 
@@ -1881,7 +1892,8 @@ def remaining_from_start(start, duration_units, now): return None if start is No
 
 def mouse_defaults(i):
     return {
-        f"experiment_start_{i}":None, f"anesthesia_start_{i}":None, f"anesthesia_due_override_{i}":None,
+        f"experiment_start_{i}":None, f"anesthesia_initial_start_{i}":None,
+        f"anesthesia_start_{i}":None, f"anesthesia_due_override_{i}":None,
         f"board_start_{i}":None, f"shock_start_{i}":None, f"shock_wallclock_{i}":None, f"resus_start_{i}":None,
         f"paused_{i}":False, f"pause_started_{i}":None, f"ended_{i}":False, f"end_time_{i}":None,
         f"anesthesia_initial_duration_{i}":DEFAULT_INITIAL_ANESTHESIA,
@@ -1892,6 +1904,7 @@ def mouse_defaults(i):
         f"notification_sound_{i}":DEFAULT_NOTIFICATION_SOUND,
         f"event_log_{i}":[], f"subject_name_{i}":f"Mouse {i}", f"mouse_weight_g_{i}":None,
         f"starting_map_mmhg_{i}":None, f"ending_map_mmhg_{i}":None,
+        f"shock_volume_ml_{i}":None, f"resuscitation_volume_ml_{i}":None,
         f"display_order_{i}":i, f"undo_history_{i}":[],
     }
 
@@ -1943,10 +1956,30 @@ def ending_map(i):
     except (TypeError,ValueError):
         return None
 
+def shock_volume(i):
+    try:
+        value=st.session_state.get(f"shock_volume_ml_{i}")
+        return None if value is None else float(value)
+    except (TypeError,ValueError):
+        return None
+
+def resuscitation_volume(i):
+    try:
+        value=st.session_state.get(f"resuscitation_volume_ml_{i}")
+        return None if value is None else float(value)
+    except (TypeError,ValueError):
+        return None
+
 def _map_summary(i):
     start=starting_map(i); end=ending_map(i); parts=[]
     if start is not None: parts.append(f"Starting MAP {start:g} mmHg")
     if end is not None: parts.append(f"Ending MAP {end:g} mmHg")
+    return " · ".join(parts)
+
+def _volume_summary(i):
+    shock=shock_volume(i); resus=resuscitation_volume(i); parts=[]
+    if shock is not None: parts.append(f"Shock volume removed {shock:g} mL")
+    if resus is not None: parts.append(f"Resuscitation volume given {resus:g} mL")
     return " · ".join(parts)
 
 def ordered_subject_indices():
@@ -2175,6 +2208,7 @@ def backtime_start_event(i,event_id,amount):
         ae=[x for x in log if x.get("Event") in ("Anesthesia started","Anesthesia redosed")]
         if ae and ae[-1].get("_id")==event_id: st.session_state[f"anesthesia_start_{i}"]=new
         if name=="Anesthesia started":
+            st.session_state[f"anesthesia_initial_start_{i}"]=new
             cur=st.session_state.get(f"experiment_start_{i}")
             if cur is None or new<float(cur): st.session_state[f"experiment_start_{i}"]=new
     log_event(i,"Time correction",f"{name} moved {amount:g} {UNIT_WORD} earlier"); persist_subject(i); clear_mouse_alerts(i); st.session_state["_needs_full_rerun"]=True; return True,None
@@ -2215,15 +2249,28 @@ def anesthesia_summary_rows(i):
 
         dose_number += 1
         weight=_anesthesia_event_weight(i,event)
+        dose_volume_ml=None if weight is None else float(weight)*ANESTHESIA_DOSE_VOLUME_ML_PER_G
         rows.append({
             "dose":dose_number,
             "type":"Initial" if event_name=="Anesthesia started" else "Redose",
             "relative":rel.get(event.get("_id"),rel.get(f"__order_{order}","—")),
             "absolute":str(event.get("Absolute time","")),
             "weight":"—" if weight is None else f"{weight:.1f} g",
+            "volume_ml":dose_volume_ml,
+            "volume":"—" if dose_volume_ml is None else f"{dose_volume_ml:.3f} mL",
         })
 
     return rows
+
+def anesthesia_usage_totals(indices):
+    totals={"Initial":{"doses":0,"volume_ml":0.0,"missing":0},"Redose":{"doses":0,"volume_ml":0.0,"missing":0}}
+    for i in indices:
+        for row in anesthesia_summary_rows(i):
+            stats=totals[row["type"]]
+            stats["doses"]+=1
+            if row["volume_ml"] is None: stats["missing"]+=1
+            else: stats["volume_ml"]+=float(row["volume_ml"])
+    return totals
 
 
 def build_all_timesheets_text():
@@ -2253,7 +2300,7 @@ def build_all_timesheets_text():
         "",
         "ANESTHESIA SUMMARY",
         "-"*96,
-        "Subject | Dose | Type | Relative time | Absolute time | Weight",
+        "Subject | Dose | Type | Relative time | Absolute time | Weight | Dose volume",
     ]
 
     any_anesthesia=False
@@ -2262,10 +2309,24 @@ def build_all_timesheets_text():
             any_anesthesia=True
             lines.append(
                 f"{subject_name(i)} | {row['dose']} | {row['type']} | "
-                f"{row['relative']} | {row['absolute']} | {row['weight']}"
+                f"{row['relative']} | {row['absolute']} | {row['weight']} | {row['volume']}"
             )
     if not any_anesthesia:
         lines.append("No anesthesia administrations recorded.")
+    else:
+        usage=anesthesia_usage_totals(indices)
+        total_doses=usage["Initial"]["doses"]+usage["Redose"]["doses"]
+        total_volume=usage["Initial"]["volume_ml"]+usage["Redose"]["volume_ml"]
+        lines += [
+            "",
+            "ANESTHESIA USE TOTALS (0.01 mL/g per administration)",
+            f"Initial doses | {usage['Initial']['doses']} doses | {usage['Initial']['volume_ml']:.3f} mL total",
+            f"Redoses | {usage['Redose']['doses']} doses | {usage['Redose']['volume_ml']:.3f} mL total",
+            f"All administrations | {total_doses} doses | {total_volume:.3f} mL total",
+        ]
+        missing=usage["Initial"]["missing"]+usage["Redose"]["missing"]
+        if missing:
+            lines.append(f"{missing} dose(s) missing a recorded weight; its volume is excluded from totals.")
 
     lines += ["", "DETAILED SUBJECT TIMESHEETS", ""]
 
@@ -2274,6 +2335,9 @@ def build_all_timesheets_text():
         map_summary=_map_summary(i)
         if map_summary:
             lines.append(map_summary)
+        volume_summary=_volume_summary(i)
+        if volume_summary:
+            lines.append(volume_summary)
 
         log=list(st.session_state.get(f"event_log_{i}",[]))
         rel=relative_time_map(i,log)
@@ -2307,6 +2371,16 @@ def mouse_is_running(i): return not is_paused(i) and not is_ended(i)
 def ensure_experiment_started(i,timestamp):
     if st.session_state.get(f"experiment_start_{i}") is None: st.session_state[f"experiment_start_{i}"]=float(timestamp)
 def anesthesia_dose_count(i): return int(st.session_state.get(f"anesthesia_dose_count_{i}",0) or 0)
+
+def anesthesia_preparation_start(i):
+    """Return the first anesthesia timestamp, preserving legacy sessions."""
+    saved=st.session_state.get(f"anesthesia_initial_start_{i}")
+    if saved is not None: return float(saved)
+    for event in st.session_state.get(f"event_log_{i}",[]):
+        if event.get("Event")=="Anesthesia started":
+            epoch=event_epoch(event)
+            if epoch is not None: return epoch
+    return st.session_state.get(f"anesthesia_start_{i}")
 def current_anesthesia_interval(i): return st.session_state.get(f"anesthesia_initial_duration_{i}",DEFAULT_INITIAL_ANESTHESIA) if anesthesia_dose_count(i)<=1 else st.session_state.get(f"anesthesia_duration_{i}",DEFAULT_SUBSEQUENT_ANESTHESIA)
 def anesthesia_due_time(i):
     override=st.session_state.get(f"anesthesia_due_override_{i}")
@@ -2404,6 +2478,7 @@ def start_or_redose_anesthesia(i):
         }
 
     ensure_experiment_started(i,now)
+    if first: st.session_state[f"anesthesia_initial_start_{i}"]=now
     st.session_state[f"anesthesia_start_{i}"]=now
     st.session_state[f"anesthesia_due_override_{i}"]=None
     st.session_state[f"anesthesia_dose_count_{i}"]=1 if first else anesthesia_dose_count(i)+1
@@ -2443,8 +2518,13 @@ def start_shock(i,force=False):
 def start_resuscitation(i,force=False):
     if not mouse_is_running(i): return
     now=time.time()
+    if starting_map(i) is None:
+        request_dialog(i,"starting_map")
+        return
     if st.session_state.get(f"resus_start_{i}") is not None or st.session_state.get(f"shock_start_{i}") is None or (not force and not shock_is_complete(i,now)): return
-    _record_global_undo(f"{'Force start resus' if force else 'Start resus'} — {subject_name(i)}",[i]); st.session_state[f"resus_start_{i}"]=now; event=log_event(i,"Resuscitation started","Forced advance before shock completed" if force else "",when_epoch=now); _push_undo(i,"start_resus",event); clear_alert(i,"Resuscitation"); persist_subject(i)
+    _record_global_undo(f"{'Force start resus' if force else 'Start resus'} — {subject_name(i)}",[i]); st.session_state[f"resus_start_{i}"]=now; st.session_state[f"shock_volume_ml_{i}"]=None; event=log_event(i,"Resuscitation started","Forced advance before shock completed" if force else "",when_epoch=now); _push_undo(i,"start_resus",event); clear_alert(i,"Resuscitation"); persist_subject(i)
+    st.session_state["_pending_dialog"]={"mouse":int(i),"kind":"shock_volume"}
+    st.session_state["_needs_full_rerun"]=True
 
 def toggle_pause(i):
     if is_ended(i): return
@@ -2453,22 +2533,30 @@ def toggle_pause(i):
         st.session_state[f"paused_{i}"]=True; st.session_state[f"pause_started_{i}"]=now; log_event(i,"Paused",when_epoch=now)
     else:
         started=st.session_state.get(f"pause_started_{i}") or now; delta=max(0,now-float(started))
-        for field in ("experiment_start","anesthesia_start","board_start","shock_start","resus_start","anesthesia_due_override"):
+        for field in ("experiment_start","anesthesia_initial_start","anesthesia_start","board_start","shock_start","resus_start","anesthesia_due_override"):
             key=f"{field}_{i}"; value=st.session_state.get(key)
             if value is not None: st.session_state[key]=float(value)+delta
         st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; log_event(i,"Resumed",f"Paused {format_timer(delta)}",when_epoch=now)
     clear_mouse_alerts(i); persist_subject(i)
 
-def end_mouse(i,forced=False,ending_map_mmhg=None):
+def end_mouse(i,forced=False,ending_map_mmhg=None,resuscitation_volume_ml=None,shock_volume_ml=None):
     if is_ended(i): return False
-    # If the subject has entered resuscitation, an ending MAP is required
-    # before the subject can be marked ended/completed.
-    if st.session_state.get(f"resus_start_{i}") is not None and ending_map_mmhg is None:
-        return False
+    if st.session_state.get(f"shock_start_{i}") is not None and starting_map(i) is None: return False
+    # Once resuscitation begins, retain every measurement needed to complete
+    # the subject record, including shock removal and resuscitation volume.
+    if st.session_state.get(f"resus_start_{i}") is not None:
+        final_shock_volume=shock_volume(i) if shock_volume_ml is None else float(shock_volume_ml)
+        if final_shock_volume is None or ending_map_mmhg is None or resuscitation_volume_ml is None: return False
     now=time.time(); _record_global_undo(f"{'Force end subject' if forced else 'End subject'} — {subject_name(i)}",[i]); end_at=st.session_state.get(f"pause_started_{i}") or now
+    if shock_volume_ml is not None:
+        st.session_state[f"shock_volume_ml_{i}"]=float(shock_volume_ml)
+        log_event(i,"Shock volume",f"{float(shock_volume_ml):g} mL removed",when_epoch=now)
     if ending_map_mmhg is not None:
         st.session_state[f"ending_map_mmhg_{i}"]=float(ending_map_mmhg)
         log_event(i,"Ending MAP",f"{float(ending_map_mmhg):g} mmHg",when_epoch=now)
+    if resuscitation_volume_ml is not None:
+        st.session_state[f"resuscitation_volume_ml_{i}"]=float(resuscitation_volume_ml)
+        log_event(i,"Resuscitation volume",f"{float(resuscitation_volume_ml):g} mL given",when_epoch=now)
     st.session_state[f"ended_{i}"]=True; st.session_state[f"end_time_{i}"]=end_at; st.session_state[f"paused_{i}"]=False; st.session_state[f"pause_started_{i}"]=None; clear_mouse_alerts(i); log_event(i,"Experiment ended","Forced advance before resuscitation completed" if forced else "",when_epoch=now); persist_subject(i); maybe_mark_experiment_complete(); return True
 
 def reset_mouse(i):
@@ -3048,6 +3136,12 @@ def _parse_map_value(raw):
     if not (1.0 <= value <= 300.0): return None,"MAP must be between 1 and 300 mmHg."
     return round(value,1),None
 
+def _parse_volume_ml(raw,label="Volume"):
+    try: value=float(raw)
+    except (TypeError,ValueError): return None,f"Enter a valid {label.lower()} in mL."
+    if not (0.0 <= value <= 100.0): return None,f"{label} must be between 0 and 100 mL."
+    return round(value,3),None
+
 @st.dialog("Starting blood pressure")
 def starting_map_dialog(i):
     st.markdown(f"### {html.escape(subject_name(i))} — starting MAP",unsafe_allow_html=True)
@@ -3065,23 +3159,50 @@ def starting_map_dialog(i):
             log_event(i,"Starting MAP",f"{value:g} mmHg",when_epoch=shock_time)
             persist_subject(i); st.session_state.pop(key,None); st.toast(f"Starting MAP saved: {value:g} mmHg"); st.rerun()
 
+@st.dialog("Start resuscitation")
+def shock_volume_dialog(i):
+    st.markdown(f"### {html.escape(subject_name(i))} — shock volume",unsafe_allow_html=True)
+    st.caption("Resuscitation has started. Record the total volume removed by the end of the shock phase.")
+    key=f"shock_volume_entry_{i}"; existing=shock_volume(i)
+    st.session_state.setdefault(key,"" if existing is None else f"{existing:g}")
+    st.text_input("Shock volume removed (mL)",key=key,placeholder="e.g. 0.8")
+    if st.button("Save shock volume",key=f"shock_volume_save_{i}",use_container_width=True,type="primary"):
+        value,error=_parse_volume_ml(st.session_state.get(key),"Shock volume")
+        if error: st.warning(error)
+        else:
+            st.session_state[f"shock_volume_ml_{i}"]=value
+            event_time=st.session_state.get(f"resus_start_{i}") or time.time()
+            log_event(i,"Shock volume",f"{value:g} mL removed",when_epoch=event_time)
+            persist_subject(i); st.session_state.pop(key,None); st.toast(f"Shock volume saved: {value:g} mL"); st.rerun()
+
 @st.dialog("Ending blood pressure")
 def ending_map_dialog(i,forced=False):
-    st.markdown(f"### {html.escape(subject_name(i))} — ending MAP",unsafe_allow_html=True)
-    st.caption("Record the final mean arterial pressure in mmHg before ending this subject.")
-    key=f"ending_map_entry_{i}"
-    existing=ending_map(i)
-    st.session_state.setdefault(key,"" if existing is None else f"{existing:g}")
-    st.text_input("MAP (mmHg)",key=key,placeholder="e.g. 75")
+    st.markdown(f"### {html.escape(subject_name(i))} — ending measurements",unsafe_allow_html=True)
+    st.caption("Record the final MAP and total resuscitation volume before ending this subject.")
+    map_key=f"ending_map_entry_{i}"; volume_key=f"resuscitation_volume_entry_{i}"; shock_key=f"ending_shock_volume_entry_{i}"
+    existing_map=ending_map(i); existing_volume=resuscitation_volume(i); existing_shock=shock_volume(i)
+    st.session_state.setdefault(map_key,"" if existing_map is None else f"{existing_map:g}")
+    st.session_state.setdefault(volume_key,"" if existing_volume is None else f"{existing_volume:g}")
+    if existing_shock is None: st.session_state.setdefault(shock_key,"")
+    st.text_input("Ending MAP (mmHg)",key=map_key,placeholder="e.g. 75")
+    if existing_shock is None: st.text_input("Shock volume removed (mL)",key=shock_key,placeholder="e.g. 0.8")
+    st.text_input("Resuscitation volume given (mL)",key=volume_key,placeholder="e.g. 0.8")
     left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key=f"ending_map_cancel_{i}",use_container_width=True): st.session_state.pop(key,None); st.rerun()
+        if st.button("Cancel",key=f"ending_map_cancel_{i}",use_container_width=True):
+            for key in (map_key,volume_key,shock_key): st.session_state.pop(key,None)
+            st.rerun()
     with right:
-        if st.button("Save MAP & end",key=f"ending_map_save_{i}",use_container_width=True,type="primary"):
-            value,error=_parse_map_value(st.session_state.get(key))
-            if error: st.warning(error)
+        if st.button("Save & end",key=f"ending_map_save_{i}",use_container_width=True,type="primary"):
+            map_value,map_error=_parse_map_value(st.session_state.get(map_key))
+            volume_value,volume_error=_parse_volume_ml(st.session_state.get(volume_key),"Resuscitation volume")
+            shock_value,shock_error=(existing_shock,None) if existing_shock is not None else _parse_volume_ml(st.session_state.get(shock_key),"Shock volume")
+            errors=[error for error in (map_error,volume_error,shock_error) if error]
+            if errors: st.warning(" ".join(errors))
             else:
-                st.session_state.pop(key,None); end_mouse(i,bool(forced),ending_map_mmhg=value); st.rerun()
+                for key in (map_key,volume_key,shock_key): st.session_state.pop(key,None)
+                end_mouse(i,bool(forced),ending_map_mmhg=map_value,resuscitation_volume_ml=volume_value,shock_volume_ml=shock_value if existing_shock is None else None)
+                st.rerun()
 
 @st.dialog("Confirm end")
 def end_confirmation_dialog(i):
@@ -3169,6 +3290,7 @@ def render_pending_dialog():
     i=int(req.get("mouse",0))
     if not 1<=i<=mouse_count(): return
     if kind=="starting_map": starting_map_dialog(i); return
+    if kind=="shock_volume": shock_volume_dialog(i); return
     if kind=="ending_map": ending_map_dialog(i,bool(req.get("forced",False))); return
     {"timesheet":timesheet_dialog,"comment":comment_dialog,"edit":edit_subject_dialog,"end":end_confirmation_dialog,"reset":reset_confirmation_dialog}.get(kind,lambda _:None)(i)
 
@@ -3616,8 +3738,23 @@ def install_browser_helpers():
         download();
       }
 
+      /*
+        This component is installed again after a full Streamlit rerun.  Keep
+        exactly one parent-window poller so those reruns cannot leave behind
+        a growing collection of 10 Hz DOM scans.  Pointing the singleton at
+        the latest closure also keeps the current component's state active.
+
+        The actual notification uses scheduleDue()'s absolute setTimeout, so
+        this one-second poll rate does not reduce alert precision.
+      */
+      root.__shockTimerBrowserHelpersPoll=poll;
       poll();
-      setInterval(poll,100);
+      if(!root.__shockTimerBrowserHelpersPollInterval){
+        root.__shockTimerBrowserHelpersPollInterval=root.setInterval(()=>{
+          const current=root.__shockTimerBrowserHelpersPoll;
+          if(typeof current==='function') current();
+        },1000);
+      }
     })();
     </script>
     """,width=1,height=1,tab_index=-1)
@@ -3688,7 +3825,9 @@ def workflow_statuses(i,now):
     return states
 
 def workflow_step_times(i,now):
-    anes,board,shock,resus=st.session_state.get(f"anesthesia_start_{i}"),st.session_state.get(f"board_start_{i}"),st.session_state.get(f"shock_start_{i}"),st.session_state.get(f"resus_start_{i}"); end_time=st.session_state.get(f"end_time_{i}") if is_ended(i) else None; times=[("","gray") for _ in range(4)]
+    anes,board,shock,resus=anesthesia_preparation_start(i),st.session_state.get(f"board_start_{i}"),st.session_state.get(f"shock_start_{i}"),st.session_state.get(f"resus_start_{i}"); end_time=st.session_state.get(f"end_time_{i}") if is_ended(i) else None; times=[("","gray") for _ in range(4)]
+    # Anesthesia is an elapsed preparation duration, not a countdown. Once
+    # board acclimation starts, freeze that recorded duration for the run.
     if anes is not None: times[0]=(format_phase_timer(elapsed_from(anes,board if board is not None else now)),"gray" if board is not None else "green")
     if board is not None:
         stop=shock if shock is not None else now; urgency=urgency_for_remaining(remaining_from_start(board,FIXED_BOARD_DURATION,now)); times[1]=(f"{format_phase_timer(elapsed_from(board,stop))} / {format_phase_timer(duration_to_seconds(FIXED_BOARD_DURATION))}","gray" if shock is not None else urgency if urgency!="normal" else "green")
@@ -3699,9 +3838,21 @@ def workflow_step_times(i,now):
     return times
 
 def workflow_html(i,now):
-    labels=["Anesthesia",f"Board {fixed_duration_label(FIXED_BOARD_DURATION)}",f"Shock {fixed_duration_label(FIXED_SHOCK_DURATION)}",f"Resus {fixed_duration_label(FIXED_RESUSCITATION_DURATION)}"]; parts=['<div class="lab-cell"><div class="lab-stepper">']
-    for idx,(state,label) in enumerate(zip(workflow_statuses(i,now),labels)):
-        timer,tone=workflow_step_times(i,now)[idx]; th=f'<div class="lab-step-time {tone}">{html.escape(timer)}</div>' if timer else '<div class="lab-step-time">&nbsp;</div>'; parts.append(f'<div class="lab-step {state}"><div class="lab-step-circle">{idx+1}</div><div class="lab-step-label">{html.escape(label)}</div>{th}</div>')
+    labels=["Anesthesia",f"Board {fixed_duration_label(FIXED_BOARD_DURATION)}",f"Shock {fixed_duration_label(FIXED_SHOCK_DURATION)}",f"Resus {fixed_duration_label(FIXED_RESUSCITATION_DURATION)}"]
+    board=st.session_state.get(f"board_start_{i}"); shock=st.session_state.get(f"shock_start_{i}"); resus=st.session_state.get(f"resus_start_{i}")
+    progress={}
+    if board is not None and shock is None:
+        progress[1]=min(100.0,max(0.0,100.0*elapsed_from(board,now)/duration_to_seconds(FIXED_BOARD_DURATION)))
+    if shock is not None and resus is None:
+        progress[2]=min(100.0,max(0.0,100.0*elapsed_from(shock,now)/duration_to_seconds(FIXED_SHOCK_DURATION)))
+    statuses=workflow_statuses(i,now); times=workflow_step_times(i,now); parts=['<div class="lab-cell"><div class="lab-stepper">']
+    for idx,(state,label) in enumerate(zip(statuses,labels)):
+        timer,tone=times[idx]
+        extra=""
+        if idx in progress:
+            extra=f' timed-progress" style="--lab-progress:{progress[idx]:.2f}%'
+        th=f'<div class="lab-step-time {tone}">{html.escape(timer)}</div>' if timer else '<div class="lab-step-time">&nbsp;</div>'
+        parts.append(f'<div class="lab-step {state}{extra}"><div class="lab-step-circle">{idx+1}</div><div class="lab-step-label">{html.escape(label)}</div>{th}</div>')
     parts.append('</div></div>'); return ''.join(parts)
 
 # ============================================================

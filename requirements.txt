@@ -1,0 +1,6 @@
+# Pin Streamlit so a Community Cloud reboot cannot silently change the runtime
+# during an experiment.  Version 1.61.1 is the version used for local testing.
+streamlit==1.61.1
+
+# Required when SHOCK_TIMER_DATABASE_URL / DATABASE_URL points to PostgreSQL.
+psycopg[binary]>=3.2,<4
