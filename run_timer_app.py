@@ -3,6 +3,10 @@
 Multi-subject experiment timer with persistent experiment state, audit-safe undo,
 MAP capture, anesthesia tracking, exported timesheets, and a compact Streamlit UI.
 
+This entry module is intentionally limited to Streamlit dialogs, rendering, and
+browser helpers. Application state, workflow transitions, persistence, reports,
+subject services, settings, and presentation CSS live in ``shock_timer/``.
+
 Maintenance notes
 -----------------
 * TESTING_MODE is the single production/testing switch.
@@ -24,21 +28,15 @@ import html
 import io
 import json
 import math
-import os
-import random
 import re
-import sqlite3
 import struct
-import threading
 import time
 import uuid
 import wave
-from datetime import datetime
-from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import streamlit as st
 
+<<<<<<< HEAD
 # ============================================================
 # APP SETTINGS.
 # ============================================================
@@ -84,6 +82,54 @@ RUNNING_ROW_COLUMNS = [1.38, 1.14, 0.74, 3.22, 1.96, 0.18, 1.58]
 RUNNING_ACTION_COLUMNS = [1.0, 0.28]
 HEADER_COLUMNS = [1.02, 4.10, 0.90, 0.88, 1.42, 1.22, 0.88]
 CONFIGURATION_COLUMNS = [0.58, 3.52, 1.58, 0.58]
+=======
+from shock_timer.settings import (
+    APP_TIMEZONE,
+    CONFIGURATION_COLUMNS,
+    DEFAULT_ANESTHESIA_DELAY,
+    DEFAULT_INITIAL_ANESTHESIA,
+    DEFAULT_NOTIFICATION_SOUND,
+    DEFAULT_NOTIFICATION_SOUND_ENABLED,
+    DEFAULT_SUBSEQUENT_ANESTHESIA,
+    FIXED_BOARD_DURATION,
+    FIXED_RESUSCITATION_DURATION,
+    FIXED_SHOCK_DURATION,
+    HEADER_COLUMNS,
+    INITIAL_MOUSE_COUNT,
+    NOTIFICATION_SOUND_OPTIONS,
+    REFRESH_INTERVAL,
+    RUNNING_ACTION_COLUMNS,
+    RUNNING_ROW_COLUMNS,
+    UNIT_LABEL,
+    UNIT_SHORT,
+    UNIT_WORD,
+)
+from shock_timer.state import (
+    default_entry_weight as _default_entry_weight,
+    duration_to_seconds,
+    effective_now,
+    elapsed_from,
+    ending_map,
+    fixed_duration_label,
+    format_phase_timer,
+    format_timer,
+    format_total_elapsed,
+    initialize_state,
+    is_ended,
+    is_paused,
+    mouse_count,
+    mouse_weight,
+    ordered_subject_indices,
+    remaining_from_start,
+    resuscitation_volume,
+    shock_volume,
+    starting_map,
+    subject_name,
+    wall_datetime,
+    warning_seconds,
+    weight_label,
+)
+>>>>>>> dev
 
 # Event/state groups used in several timer and audit paths. Centralizing these
 # avoids subtle drift between UI validation, corrections, and pause handling.
@@ -108,6 +154,7 @@ st.set_page_config(
 )
 
 # ============================================================
+<<<<<<< HEAD
 # VISUAL SYSTEM
 # ============================================================
 
@@ -1977,12 +2024,19 @@ def install_app_styles():
     """Install the complete application stylesheet once per script rerun."""
     st.markdown("<style>" + APP_CSS + "</style>", unsafe_allow_html=True)
 
+=======
+from shock_timer.styles import install_app_styles
+>>>>>>> dev
 
 
 # ============================================================
-# TIME / STATE HELPERS
+# CORE SERVICES
 # ============================================================
+# The entry point renders Streamlit views; all timing, session schema,
+# persistence, audit logging, exports, and workflow mutations live in the
+# package below.  Existing flat session keys remain unchanged for saved data.
 
+<<<<<<< HEAD
 def duration_to_seconds(value): return float(value) * UNIT_SECONDS
 def warning_seconds(): return duration_to_seconds(WARNING_UNITS)
 def rounded_seconds(seconds): return max(0, int(round(float(seconds))))
@@ -2181,8 +2235,59 @@ def initialize_database():
         try: _db_execute("ALTER TABLE experiments ADD COLUMN completed_at DOUBLE PRECISION")
         except Exception: pass
     return True
+=======
+from shock_timer.persistence import (
+    DATABASE_KIND,
+    create_experiment_record,
+    delete_experiment_record,
+    end_experiment_record,
+    initialize_database,
+    list_experiment_records,
+    load_experiment_into_session,
+    persist_subject,
+    persist_subjects,
+    rename_experiment_record,
+    retry_unsaved_subjects,
+)
+from shock_timer.reporting import (
+    anesthesia_summary_rows,
+    build_all_timesheets_text,
+    is_backtime_editable_event,
+    log_event,
+    relative_time_map,
+)
+from shock_timer.workflow import (
+    alert_key,
+    anesthesia_dose_count,
+    anesthesia_preparation_start,
+    anesthesia_remaining,
+    backtime_start_event,
+    board_is_complete,
+    clear_mouse_alerts,
+    delay_anesthesia_reminder,
+    end_all_subjects_current_experiment,
+    end_mouse,
+    global_undo_available,
+    global_undo_label,
+    global_undo_last_action,
+    global_undo_token,
+    latest_undo_action,
+    record_global_undo,
+    reset_mouse,
+    resus_is_complete,
+    shock_is_complete,
+    start_board,
+    start_or_redose_anesthesia,
+    start_resuscitation,
+    start_shock,
+    toggle_pause,
+    undo_label,
+    undo_last_stage_action,
+)
+>>>>>>> dev
 
 
+<<<<<<< HEAD
 def _default_subject_payload(i): return {k:_copy_value(v) for k,v in mouse_defaults(i).items()}
 def _subject_payload(i): return {k:_copy_value(st.session_state.get(k,v)) for k,v in mouse_defaults(i).items()}
 def _load_subject_payload(i,payload):
@@ -2332,10 +2437,13 @@ def maybe_mark_experiment_complete():
     if exp_id:
         now=time.time(); _db_execute("UPDATE experiments SET completed_at=COALESCE(completed_at,?),updated_at=? WHERE id=?",(now,now,exp_id))
 
+=======
+>>>>>>> dev
 # ============================================================
-# EVENT LOG / TIMESHEETS
+# SUBJECT SERVICES
 # ============================================================
 
+<<<<<<< HEAD
 def log_event(i,event_name,details="",when_epoch=None):
     epoch=float(when_epoch if when_epoch is not None else time.time()); key=f"event_log_{i}"; log=list(st.session_state.get(key,[])); entry={"_id":uuid.uuid4().hex,"Event":str(event_name),"Absolute time":wall_datetime(epoch).strftime("%Y-%m-%d %H:%M:%S"),"Details":str(details or ""),"_epoch":epoch}; log.append(entry); st.session_state[key]=log; return entry
 
@@ -3233,6 +3341,18 @@ def move_subject(i,direction):
     pos=peers.index(i); target=pos+int(direction)
     if target<0 or target>=len(peers): return False
     other=peers[target]; _record_global_undo(f"Reorder subjects — {subject_name(i)}",[i,other]); a=float(st.session_state.get(f"display_order_{i}",i)); b=float(st.session_state.get(f"display_order_{other}",other)); st.session_state[f"display_order_{i}"]=b; st.session_state[f"display_order_{other}"]=a; persist_subjects([i,other]); st.session_state["_needs_full_rerun"]=True; return True
+=======
+from shock_timer.subjects import (
+    create_mouse_subject,
+    mouse_is_complete,
+    move_subject,
+    queue_weight_warning,
+    reorder_group,
+    save_subject_profile,
+    validate_mouse_name_weight,
+    weight_requires_confirmation,
+)
+>>>>>>> dev
 
 # ============================================================
 # NEW EXPERIMENT CONFIGURATION / HOME
@@ -3752,6 +3872,7 @@ def return_to_experiment_home():
 # ACTIVE EXPERIMENT DIALOGS
 # ============================================================
 
+<<<<<<< HEAD
 def _render_timesheet_measurement_summary(i):
     summary_items = [
         ("Starting MAP", "—" if starting_map(i) is None else f"{starting_map(i):g} mmHg"),
@@ -3773,6 +3894,11 @@ def _render_timesheet_measurement_summary(i):
         f'<div class="ts-summary-grid">{summary_html}</div>',
         unsafe_allow_html=True,
     )
+=======
+@st.dialog("Timesheet",width="large",dismissible=False)
+def timesheet_dialog(i):
+    st.markdown(f"### {html.escape(subject_name(i))} timesheet",unsafe_allow_html=True)
+>>>>>>> dev
 
 
 def _render_timesheet_anesthesia_summary(i):
@@ -3877,6 +4003,7 @@ def _render_timesheet_event_table(i, log):
                     )
 
             with row[4]:
+<<<<<<< HEAD
                 if is_backtime_editable_event(event):
                     if st.button(
                         "Back-time",
@@ -3977,8 +4104,24 @@ def timesheet_dialog(i):
     _render_timesheet_event_table(i, log)
     _render_timesheet_backtime_panel(i, log)
 
+=======
+                if is_backtime_editable_event(e) and st.button("Back-time",key=f"backtime_select_{i}_{e.get('_id')}",use_container_width=True): st.session_state[f"_backtime_target_{i}"]=e.get("_id")
+        target=st.session_state.get(f"_backtime_target_{i}")
+        if target:
+            st.divider(); st.markdown("**Back-time selected event**"); amount=st.number_input(f"{UNIT_WORD.capitalize()} earlier",min_value=.1,step=.5,value=1.0,key=f"backtime_amount_{i}"); left,right=st.columns(2)
+            with left:
+                if st.button("Cancel adjustment",key=f"backtime_cancel_{i}",use_container_width=True): st.session_state.pop(f"_backtime_target_{i}",None); st.rerun()
+            with right:
+                if st.button("Apply back-time",key=f"backtime_apply_{i}",use_container_width=True,type="primary"):
+                    ok,error=backtime_start_event(i,target,amount)
+                    if ok: st.session_state.pop(f"_backtime_target_{i}",None); st.rerun()
+                    st.warning(error)
+    if st.button("Close",key=f"timesheet_close_{i}",use_container_width=True):
+        close_active_dialog()
+        st.rerun()
+>>>>>>> dev
 
-@st.dialog("Add comment")
+@st.dialog("Add comment",dismissible=False)
 def comment_dialog(i):
     key=f"comment_text_{i}"
     st.session_state.setdefault(key,"")
@@ -3987,6 +4130,7 @@ def comment_dialog(i):
     st.text_area("Comment",key=key,height=130)
     left,right=st.columns(2)
     with left:
+<<<<<<< HEAD
         if st.button("Cancel",key=f"comment_cancel_{i}",use_container_width=True):
             st.session_state.pop(key,None)
             st.rerun()
@@ -4210,6 +4354,29 @@ def edit_subject_dialog(i):
             else:
                 _commit_edit_subject_form(i, name, weight, edits)
 
+=======
+        if st.button("Cancel",key=f"comment_cancel_{i}",use_container_width=True): close_active_dialog(); st.session_state.pop(key,None); st.rerun()
+    with right:
+        if st.button("Accept",key=f"comment_accept_{i}",use_container_width=True,type="primary"):
+            text=str(st.session_state.get(key,"")).strip()
+            if not text: st.warning("Enter a comment.")
+            else: log_event(i,"Comment",text); persist_subject(i); close_active_dialog(); st.session_state.pop(key,None); st.rerun()
+
+@st.dialog("Edit subject",dismissible=False)
+def edit_subject_dialog(i):
+    nk,wk=f"edit_name_{i}",f"edit_weight_{i}"; st.session_state.setdefault(nk,subject_name(i)); st.session_state.setdefault(wk,float(mouse_weight(i) or 0.0)); st.text_input("Subject name",key=nk); st.number_input("Weight (g)",min_value=0.0,max_value=100.0,step=.1,format="%.1f",key=wk); left,right=st.columns(2)
+    with left:
+        if st.button("Cancel",key=f"edit_cancel_{i}",use_container_width=True): close_active_dialog(); st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
+    with right:
+        if st.button("Save",key=f"edit_save_{i}",use_container_width=True,type="primary"):
+            name,weight,error=validate_mouse_name_weight(st.session_state.get(nk),st.session_state.get(wk),f"Mouse {i}")
+            if error: st.warning(error)
+            elif weight_requires_confirmation(weight): close_active_dialog(); queue_weight_warning("edit_subject",[{"name":name,"weight_g":weight}],mouse=i); st.rerun()
+            else:
+                ok,error=save_subject_profile(i,name,weight)
+                if ok: close_active_dialog(); st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
+                st.warning(error)
+>>>>>>> dev
 
 @st.cache_data(show_spinner=False)
 def notification_sound_wav(sound_name):
@@ -4269,7 +4436,7 @@ def settings_dialog():
     with right:
         if st.button("Save settings",key="settings_save",use_container_width=True,type="primary"):
             initial=int(st.session_state[ik]); subsequent=int(st.session_state[sk]); delay=int(st.session_state[dk]); enabled=bool(st.session_state[ek]); sound=str(st.session_state[nk])
-            _record_global_undo("Update global settings",range(1,mouse_count()+1))
+            record_global_undo("Update global settings",range(1,mouse_count()+1))
             for i in range(1,mouse_count()+1): st.session_state[f"anesthesia_initial_duration_{i}"]=initial; st.session_state[f"anesthesia_duration_{i}"]=subsequent; st.session_state[f"anesthesia_delay_duration_{i}"]=delay; st.session_state[f"notification_sound_enabled_{i}"]=enabled; st.session_state[f"notification_sound_{i}"]=sound
             persist_subjects(range(1,mouse_count()+1)); st.toast("Global settings updated"); st.rerun()
 
@@ -4285,6 +4452,7 @@ def _parse_volume_ml(raw,label="Volume"):
     if not (0.0 <= value <= 100.0): return None,f"{label} must be between 0 and 100 mL."
     return round(value,3),None
 
+<<<<<<< HEAD
 def _parse_optional_map_value(raw,label):
     raw=str(raw or "").strip()
     if not raw:
@@ -4300,6 +4468,9 @@ def _parse_optional_volume_ml(raw,label):
     return value,error
 
 @st.dialog("Starting blood pressure")
+=======
+@st.dialog("Starting blood pressure",dismissible=False)
+>>>>>>> dev
 def starting_map_dialog(i):
     st.markdown(f"### {html.escape(subject_name(i))} — starting MAP",unsafe_allow_html=True)
     st.caption("The shock timer has already started. Record the mean arterial pressure at shock start.")
@@ -4314,24 +4485,37 @@ def starting_map_dialog(i):
             st.session_state[f"starting_map_mmhg_{i}"]=value
             shock_time=st.session_state.get(f"shock_start_{i}") or time.time()
             log_event(i,"Starting MAP",f"{value:g} mmHg",when_epoch=shock_time)
-            persist_subject(i); st.session_state.pop(key,None); st.toast(f"Starting MAP saved: {value:g} mmHg"); st.rerun()
+            persist_subject(i); close_active_dialog(); st.session_state.pop(key,None); st.toast(f"Starting MAP saved: {value:g} mmHg"); st.rerun()
 
+<<<<<<< HEAD
 @st.dialog("Start resuscitation")
 def shock_volume_dialog(i):
     st.markdown(f"### {html.escape(subject_name(i))} — shock volume",unsafe_allow_html=True)
     st.caption("Resuscitation has started. Record the total volume removed by the end of the shock phase.")
     key=f"shock_volume_entry_{i}"
     existing=shock_volume(i)
+=======
+@st.dialog("Start resuscitation",dismissible=False)
+def shock_volume_dialog(i):
+    st.markdown(f"### {html.escape(subject_name(i))} — shock volume",unsafe_allow_html=True)
+    st.caption("Resuscitation has started. Record the total volume removed by the end of the shock phase.")
+    key=f"shock_volume_entry_{i}"; existing=shock_volume(i)
+>>>>>>> dev
     st.session_state.setdefault(key,"" if existing is None else f"{existing:g}")
     st.text_input("Shock volume removed (mL)",key=key,placeholder="e.g. 0.8")
     if st.button("Save shock volume",key=f"shock_volume_save_{i}",use_container_width=True,type="primary"):
         value,error=_parse_volume_ml(st.session_state.get(key),"Shock volume")
+<<<<<<< HEAD
         if error:
             st.warning(error)
+=======
+        if error: st.warning(error)
+>>>>>>> dev
         else:
             st.session_state[f"shock_volume_ml_{i}"]=value
             event_time=st.session_state.get(f"resus_start_{i}") or time.time()
             log_event(i,"Shock volume",f"{value:g} mL removed",when_epoch=event_time)
+<<<<<<< HEAD
             persist_subject(i)
             st.session_state.pop(key,None)
             st.toast(f"Shock volume saved: {value:g} mL")
@@ -4348,17 +4532,38 @@ def ending_map_dialog(i,forced=False):
     st.session_state.setdefault(map_key,"" if existing_map is None else f"{existing_map:g}")
     st.session_state.setdefault(volume_key,"" if existing_volume is None else f"{existing_volume:g}")
     st.text_input("Ending MAP (mmHg)",key=map_key,placeholder="e.g. 75")
+=======
+            persist_subject(i); close_active_dialog(); st.session_state.pop(key,None); st.toast(f"Shock volume saved: {value:g} mL"); st.rerun()
+
+@st.dialog("Ending blood pressure",dismissible=False)
+def ending_map_dialog(i,forced=False):
+    st.markdown(f"### {html.escape(subject_name(i))} — ending measurements",unsafe_allow_html=True)
+    st.caption("Record the final MAP and total resuscitation volume before ending this subject.")
+    map_key=f"ending_map_entry_{i}"; volume_key=f"resuscitation_volume_entry_{i}"; shock_key=f"ending_shock_volume_entry_{i}"
+    existing_map=ending_map(i); existing_volume=resuscitation_volume(i); existing_shock=shock_volume(i)
+    st.session_state.setdefault(map_key,"" if existing_map is None else f"{existing_map:g}")
+    st.session_state.setdefault(volume_key,"" if existing_volume is None else f"{existing_volume:g}")
+    if existing_shock is None: st.session_state.setdefault(shock_key,"")
+    st.text_input("Ending MAP (mmHg)",key=map_key,placeholder="e.g. 75")
+    if existing_shock is None: st.text_input("Shock volume removed (mL)",key=shock_key,placeholder="e.g. 0.8")
+>>>>>>> dev
     st.text_input("Resuscitation volume given (mL)",key=volume_key,placeholder="e.g. 0.8")
     left,right=st.columns(2)
     with left:
         if st.button("Cancel",key=f"ending_map_cancel_{i}",use_container_width=True):
+<<<<<<< HEAD
             st.session_state.pop(map_key,None)
             st.session_state.pop(volume_key,None)
+=======
+            close_active_dialog()
+            for key in (map_key,volume_key,shock_key): st.session_state.pop(key,None)
+>>>>>>> dev
             st.rerun()
     with right:
         if st.button("Save & end",key=f"ending_map_save_{i}",use_container_width=True,type="primary"):
             map_value,map_error=_parse_map_value(st.session_state.get(map_key))
             volume_value,volume_error=_parse_volume_ml(st.session_state.get(volume_key),"Resuscitation volume")
+<<<<<<< HEAD
             errors=[error for error in (map_error,volume_error) if error]
             if errors:
                 st.warning(" ".join(errors))
@@ -4366,23 +4571,32 @@ def ending_map_dialog(i,forced=False):
                 st.session_state.pop(map_key,None)
                 st.session_state.pop(volume_key,None)
                 end_mouse(i,bool(forced),ending_map_mmhg=map_value,resuscitation_volume_ml=volume_value)
+=======
+            shock_value,shock_error=(existing_shock,None) if existing_shock is not None else _parse_volume_ml(st.session_state.get(shock_key),"Shock volume")
+            errors=[error for error in (map_error,volume_error,shock_error) if error]
+            if errors: st.warning(" ".join(errors))
+            else:
+                close_active_dialog()
+                for key in (map_key,volume_key,shock_key): st.session_state.pop(key,None)
+                end_mouse(i,bool(forced),ending_map_mmhg=map_value,resuscitation_volume_ml=volume_value,shock_volume_ml=shock_value if existing_shock is None else None)
+>>>>>>> dev
                 st.rerun()
 
-@st.dialog("Confirm end")
+@st.dialog("Confirm end",dismissible=False)
 def end_confirmation_dialog(i):
     st.markdown(f"### End {html.escape(subject_name(i))}?",unsafe_allow_html=True); st.write("This freezes the subject timers and preserves the timesheet."); left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key=f"end_cancel_{i}",use_container_width=True): st.rerun()
+        if st.button("Cancel",key=f"end_cancel_{i}",use_container_width=True): close_active_dialog(); st.rerun()
     with right:
-        if st.button("End subject",key=f"end_confirm_{i}",use_container_width=True,type="primary"): end_mouse(i); st.rerun()
+        if st.button("End subject",key=f"end_confirm_{i}",use_container_width=True,type="primary"): close_active_dialog(); end_mouse(i); st.rerun()
 
-@st.dialog("Reset subject")
+@st.dialog("Reset subject",dismissible=False)
 def reset_confirmation_dialog(i):
     st.markdown(f"### Reset {html.escape(subject_name(i))}?",unsafe_allow_html=True); st.write("This clears timer events and timesheet entries for this subject."); left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key=f"reset_cancel_{i}",use_container_width=True): st.rerun()
+        if st.button("Cancel",key=f"reset_cancel_{i}",use_container_width=True): close_active_dialog(); st.rerun()
     with right:
-        if st.button("Reset",key=f"reset_confirm_{i}",use_container_width=True,type="primary"): reset_mouse(i); st.rerun()
+        if st.button("Reset",key=f"reset_confirm_{i}",use_container_width=True,type="primary"): close_active_dialog(); reset_mouse(i); st.rerun()
 
 END_ALL_INPUT_PREFIXES = (
     "end_all_start_map_",
@@ -4621,24 +4835,29 @@ def storage_exit_dialog():
                 "and retry when storage is available."
             )
 
-@st.dialog("Add mouse")
+@st.dialog("Add mouse",dismissible=False)
 def add_mouse_dialog():
     new_i=mouse_count()+1; nk,wk="_add_mouse_name","_add_mouse_weight"; st.session_state.setdefault(nk,f"Mouse {new_i}"); st.session_state.setdefault(wk,_default_entry_weight()); st.caption("Enter the mouse name and weight before adding it to the running experiment."); st.text_input("Mouse name",key=nk); st.number_input("Weight (g)",min_value=0.0,max_value=100.0,step=.1,format="%.1f",key=wk); left,right=st.columns(2)
     with left:
-        if st.button("Cancel",key="add_mouse_cancel",use_container_width=True): st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
+        if st.button("Cancel",key="add_mouse_cancel",use_container_width=True): close_active_dialog(); st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
     with right:
         if st.button("Add mouse",key="add_mouse_confirm",use_container_width=True,type="primary"):
             name,weight,error=validate_mouse_name_weight(st.session_state.get(nk),st.session_state.get(wk),f"Mouse {new_i}")
             if error: st.warning(error)
-            elif weight_requires_confirmation(weight): queue_weight_warning("add_mouse",[{"name":name,"weight_g":weight}]); st.rerun()
+            elif weight_requires_confirmation(weight): close_active_dialog(); queue_weight_warning("add_mouse",[{"name":name,"weight_g":weight}]); st.rerun()
             else:
                 ok,error=create_mouse_subject(name,weight)
-                if ok: st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
+                if ok: close_active_dialog(); st.session_state.pop(nk,None); st.session_state.pop(wk,None); st.rerun()
                 st.warning(error)
 
 def request_add_mouse_dialog():
     st.session_state["_pending_dialog"]={"mouse":0,"kind":"add_mouse"}
     st.session_state["_needs_full_rerun"]=True
+
+def close_active_dialog():
+    """Dismiss the dialog opened through the fragment-to-app handoff."""
+    st.session_state.pop("_active_dialog",None)
+    st.session_state.pop("_pending_dialog",None)
 
 def request_dialog(i,kind,**extra):
     st.session_state["_pending_dialog"]={"mouse":int(i),"kind":kind,**extra}
@@ -4664,6 +4883,12 @@ def _rerun_entire_app():
 
 def render_pending_dialog():
     req=st.session_state.pop("_pending_dialog",None)
+    if req:
+        # A timer row lives in a fragment, but Streamlit dialogs must be
+        # rendered by the full app. Retain the request until a dialog action
+        # explicitly dismisses it, rather than losing it on the next refresh.
+        st.session_state["_active_dialog"]=req
+    req=st.session_state.get("_active_dialog")
     if not req: return
     kind=req.get("kind")
     if kind=="add_mouse": add_mouse_dialog(); return
@@ -5292,8 +5517,23 @@ BROWSER_HELPERS_HTML = r"""
         maintainWakeLock();
       }
 
+      /*
+        This component is installed again after a full Streamlit rerun.  Keep
+        exactly one parent-window poller so those reruns cannot leave behind
+        a growing collection of 10 Hz DOM scans.  Pointing the singleton at
+        the latest closure also keeps the current component's state active.
+
+        The actual notification uses scheduleDue()'s absolute setTimeout, so
+        this one-second poll rate does not reduce alert precision.
+      */
+      root.__shockTimerBrowserHelpersPoll=poll;
       poll();
-      setInterval(poll,100);
+      if(!root.__shockTimerBrowserHelpersPollInterval){
+        root.__shockTimerBrowserHelpersPollInterval=root.setInterval(()=>{
+          const current=root.__shockTimerBrowserHelpersPoll;
+          if(typeof current==='function') current();
+        },1000);
+      }
     })();
     </script>
     """
@@ -5417,7 +5657,9 @@ def workflow_statuses(i,now):
     return states
 
 def workflow_step_times(i,now):
-    anes,board,shock,resus=st.session_state.get(f"anesthesia_start_{i}"),st.session_state.get(f"board_start_{i}"),st.session_state.get(f"shock_start_{i}"),st.session_state.get(f"resus_start_{i}"); end_time=st.session_state.get(f"end_time_{i}") if is_ended(i) else None; times=[("","gray") for _ in range(4)]
+    anes,board,shock,resus=anesthesia_preparation_start(i),st.session_state.get(f"board_start_{i}"),st.session_state.get(f"shock_start_{i}"),st.session_state.get(f"resus_start_{i}"); end_time=st.session_state.get(f"end_time_{i}") if is_ended(i) else None; times=[("","gray") for _ in range(4)]
+    # Anesthesia is an elapsed preparation duration, not a countdown. Once
+    # board acclimation starts, freeze that recorded duration for the run.
     if anes is not None: times[0]=(format_phase_timer(elapsed_from(anes,board if board is not None else now)),"gray" if board is not None else "green")
     if board is not None:
         stop=shock if shock is not None else now; urgency=urgency_for_remaining(remaining_from_start(board,FIXED_BOARD_DURATION,now)); times[1]=(f"{format_phase_timer(elapsed_from(board,stop))} / {format_phase_timer(duration_to_seconds(FIXED_BOARD_DURATION))}","gray" if shock is not None else urgency if urgency!="normal" else "green")
@@ -5428,9 +5670,21 @@ def workflow_step_times(i,now):
     return times
 
 def workflow_html(i,now):
-    labels=["Anesthesia",f"Board {fixed_duration_label(FIXED_BOARD_DURATION)}",f"Shock {fixed_duration_label(FIXED_SHOCK_DURATION)}",f"Resus {fixed_duration_label(FIXED_RESUSCITATION_DURATION)}"]; parts=['<div class="lab-cell"><div class="lab-stepper">']
-    for idx,(state,label) in enumerate(zip(workflow_statuses(i,now),labels)):
-        timer,tone=workflow_step_times(i,now)[idx]; th=f'<div class="lab-step-time {tone}">{html.escape(timer)}</div>' if timer else '<div class="lab-step-time">&nbsp;</div>'; parts.append(f'<div class="lab-step {state}"><div class="lab-step-circle">{idx+1}</div><div class="lab-step-label">{html.escape(label)}</div>{th}</div>')
+    labels=["Anesthesia",f"Board {fixed_duration_label(FIXED_BOARD_DURATION)}",f"Shock {fixed_duration_label(FIXED_SHOCK_DURATION)}",f"Resus {fixed_duration_label(FIXED_RESUSCITATION_DURATION)}"]
+    board=st.session_state.get(f"board_start_{i}"); shock=st.session_state.get(f"shock_start_{i}"); resus=st.session_state.get(f"resus_start_{i}")
+    progress={}
+    if board is not None and shock is None:
+        progress[1]=min(100.0,max(0.0,100.0*elapsed_from(board,now)/duration_to_seconds(FIXED_BOARD_DURATION)))
+    if shock is not None and resus is None:
+        progress[2]=min(100.0,max(0.0,100.0*elapsed_from(shock,now)/duration_to_seconds(FIXED_SHOCK_DURATION)))
+    statuses=workflow_statuses(i,now); times=workflow_step_times(i,now); parts=['<div class="lab-cell"><div class="lab-stepper">']
+    for idx,(state,label) in enumerate(zip(statuses,labels)):
+        timer,tone=times[idx]
+        extra=""
+        if idx in progress:
+            extra=f' timed-progress" style="--lab-progress:{progress[idx]:.2f}%'
+        th=f'<div class="lab-step-time {tone}">{html.escape(timer)}</div>' if timer else '<div class="lab-step-time">&nbsp;</div>'
+        parts.append(f'<div class="lab-step {state}{extra}"><div class="lab-step-circle">{idx+1}</div><div class="lab-step-label">{html.escape(label)}</div>{th}</div>')
     parts.append('</div></div>'); return ''.join(parts)
 
 # ============================================================
@@ -5561,6 +5815,7 @@ def force_advance(i):
     elif label=="⏭ Force end subject": request_end_dialog(i,True)
 
 def _process_menu(i,selection):
+<<<<<<< HEAD
     """
     Handle one individual-subject menu action.
 
@@ -5606,6 +5861,27 @@ def render_overflow_control(i,now,reorder_peers=None):
         ]
     else:
         peers=reorder_peers
+=======
+    if not selection: return
+    # Menu choices are rendered from the refresh fragment, whereas dialogs
+    # must be opened during a full app rerun. Request the dialog, then rerun
+    # the complete app explicitly instead of relying on a fragment rerun.
+    if selection=="View timesheet": request_dialog(i,"timesheet"); _rerun_entire_app()
+    elif selection=="Add comment": request_dialog(i,"comment"); _rerun_entire_app()
+    elif selection=="Edit subject": request_dialog(i,"edit"); _rerun_entire_app()
+    elif selection in ("Ⅱ Pause","▶ Resume"): toggle_pause(i); st.rerun()
+    elif selection=="↑ Move up": move_subject(i,-1); st.rerun()
+    elif selection=="↓ Move down": move_subject(i,1); st.rerun()
+    elif selection.startswith("↶ Undo"): undo_last_stage_action(i); st.rerun()
+    elif selection.startswith("⏭ Force"):
+        force_advance(i)
+        _rerun_entire_app()
+    elif selection=="↻ Reset subject": request_dialog(i,"reset"); _rerun_entire_app()
+    elif selection=="■ End subject": request_end_dialog(i,False); _rerun_entire_app()
+
+def render_overflow_control(i,now):
+    options=["View timesheet","Add comment","Edit subject"]; group=reorder_group(i,time.time()); peers=[j for j in ordered_subject_indices() if reorder_group(j,time.time())==group]
+>>>>>>> dev
     if i in peers:
         pos=peers.index(i)
         if pos>0:
@@ -5615,9 +5891,13 @@ def render_overflow_control(i,now,reorder_peers=None):
 
     # Timer-changing actions remain limited to active subjects.
     undo=latest_undo_action(i)
+<<<<<<< HEAD
     if undo and not is_ended(i):
         options.append(f"↶ Undo {_undo_label(undo)}")
 
+=======
+    if undo and not is_ended(i): options.append(f"↶ Undo {undo_label(undo)}")
+>>>>>>> dev
     force=force_advance_label(i,now)
     if force:
         options.append(force)
